@@ -35,35 +35,6 @@ class ApiException : System.Exception {
     }
 }
 
-function Get-ClassRoster {
-    Param (
-        [Parameter(Mandatory)][string]$Class,
-        [string]$Path = $null
-    )
-
-    if (-not $Path) {
-        $Path = "\\hh.nku.edu\departments$\College of Informatics\Dean's Office\Current Dean COI\Griffin Hall\Class Lists\Auto Generated Informatics Roster - Class.csv"
-    }
-
-    try {
-        $csv = Import-CSV -Path $Path
-		$dept, $sec = $Class.Split(" ")
-    
-		$students = $csv | ? {$_.Department -match $dept -and $_.Section -match $sec} | Select -ExpandProperty Student_ID
-		$professor = $csv | ? {$_.Department -match $dept -and $_.Section -match $sec} | Select -ExpandProperty Instructor | Get-Unique
-		
-		if ((-not $students) -or (-not $professor)) {
-			throw "Empty student or professor list returned for $($Class). Make sure it is correct."
-		}
-        Write-Host "Roster successfully imported" -ForegroundColor Green
-    }
-    catch {
-        Write-Warning "Unable to import class roster list to find $($Class)."
-    }
-
-	return $students, $professor
-}
-
 function Invoke-PVEAPI {
     Param (
         [Parameter(Mandatory)][string]$Route,
@@ -167,6 +138,37 @@ function Get-NextNode {
     return $nodes[$next_index], $next_index
 }
 
+# -------- Exported Functions --------
+
+function Get-ClassRoster {
+    Param (
+        [Parameter(Mandatory)][string]$Class,
+        [string]$Path = $null
+    )
+
+    if (-not $Path) {
+        $Path = "\\hh.nku.edu\departments$\College of Informatics\Dean's Office\Current Dean COI\Griffin Hall\Class Lists\Auto Generated Informatics Roster - Class.csv"
+    }
+
+    try {
+        $csv = Import-CSV -Path $Path
+		$dept, $sec = $Class.Split(" ")
+    
+		$students = $csv | ? {$_.Department -match $dept -and $_.Section -match $sec} | Select -ExpandProperty Student_ID
+		$professor = $csv | ? {$_.Department -match $dept -and $_.Section -match $sec} | Select -ExpandProperty Instructor | Get-Unique
+		
+		if ((-not $students) -or (-not $professor)) {
+			throw "Empty student or professor list returned for $($Class). Make sure it is correct."
+		}
+        Write-Host "Roster successfully imported" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Unable to import class roster list to find $($Class)."
+    }
+
+	return $students, $professor
+}
+
 function Get-Templates {
     Param (
         [Parameter(Mandatory)][string]$Class
@@ -185,8 +187,6 @@ function Clone-ClassVMs {
         [string]$CustomRosterPath = $null
     )
 
-    $last_index = -1
-
     $class_roster = Get-ClassRoster -Class $Class -Path $CustomRosterPath
     $student_list, $professor = $class_roster[0], $class_roster[1]
     $users = @($student_list) + $professor
@@ -197,11 +197,12 @@ function Clone-ClassVMs {
     $pool_id = $Class -replace ' ', ''
     Create-Pool -id $pool_id
 
+    $last_index = -1
     foreach ($template in (Get-Templates -Class $Class)) {
         Write-Host "Cloning from template $($template.name);$($template.vmid)..." -BackgroundColor White -ForegroundColor Black
         foreach ($user in $users) {
             $node, $last_index = Get-NextNode $last_index
-            $name = "$($pool_id)-$($user)-$($template.name -replace '.*\d+','')"
+            #$name = "$($pool_id)-$($user)-$($template.name -replace '.*\d+','')"
 
             Write-Host "Creating VM for $user with ID $vm_id on host $node with name $name"
             
@@ -210,9 +211,9 @@ function Clone-ClassVMs {
                 node = $node
                 vmid = $template.vmid
                 pool = $pool_id
-                name = $name
+                #name = $name
             }
-            #$vm = Invoke-PVEAPI -Route "nodes/$node/qemu/$($template.vmid)/clone" -Params @{Headers = $Vars.Headers; Method="POST"; Body = @{newid=373;node="COIVMHOST1";vmid=$($template.vmid)}}
+            #$vm = Invoke-PVEAPI -Route "nodes/$node/qemu/$($template.vmid)/clone" -Params @{Headers = $Vars.Headers; Method="POST"; Body = $body}
             $vm_id++
         }
     }
