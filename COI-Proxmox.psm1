@@ -1,3 +1,8 @@
+# Keep this until COI stops using self signed certificates. There's 3 solutions here:
+# 1. Manually import the certificates to make Windows trust them (not happening)
+# 2. Call the curl binary directly instead of Invoke-WebRequest to use the -k certificate check skip option (It'd be better to keep everything in PowerShell)
+# 3. The best option: Create a custom C# class to ignore certificate errors and import this policy which effectively makes Windows trust all SSL certificates.
+# Obviously this isn't very secure, but these settings only persist for the current session so it'll be fine until COI stops using self-signed certificates.
 add-type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
@@ -78,6 +83,7 @@ function Invoke-PVEAPI {
 
 function Get-AccessTicket {
     # To prevent re-authenticating within the same PowerShell session, the access ticket and CSRF token are stored in (ephemeral) environment variables
+    # Note that tickets only last for 2 hours. So it might be possible that someone leaves a terminal open and tries to clone VMs again, only to be met with 401 errors. If that happens just restart the terminal.
     if (-not ($env:ACCESS_TICKET -and $env:CSRF_TOKEN)) {
         $Credentials = (Get-Credential -Credential $env:USERNAME)
         $params = @{
@@ -90,10 +96,15 @@ function Get-AccessTicket {
         }
 
         $ticket = Invoke-PVEAPI -Route "access/ticket" -Params $params -ErrorBehavior "Stop"
-        $env:ACCESS_TICKET = "PVEAuthCookie=$($ticket.data.ticket)"
-        $env:CSRF_TOKEN = $ticket.data.CSRFPreventionToken
-
-        Write-Host "Session API keys successfully obtained" -ForegroundColor Green
+        if ($ticket.data.ticket -and $ticket.data.CSRFPreventionToken) {
+            $env:ACCESS_TICKET = "PVEAuthCookie=$($ticket.data.ticket)"
+            $env:CSRF_TOKEN = $ticket.data.CSRFPreventionToken
+    
+            Write-Host "Session API keys successfully obtained" -ForegroundColor Green
+        }
+        else {
+            throw "Could not obtain session ticket and CSRF token. Make sure you have the right permissions on Proxmox."
+        }
     }
 
     # Authorization headers don't use the environment variables directly, rather this function just returns them as a hashtable. This is because environment variables have to be strings and I don't want to construct the hashtable every time I need to use them.
@@ -143,7 +154,7 @@ function Get-NextNode {
 
 # -------- Exported Functions --------
 
-function Get-ClassRoster {
+function Get-PVEClassRoster {
     Param (
         [Parameter(Mandatory)][string]$Class,
         [string]$Path = $null
@@ -185,7 +196,7 @@ function Get-Templates {
     return $template_list
 }
 
-function Set-ACL {
+function Set-ProxmoxACL {
     Param (
         [Parameter(Mandatory)][string]$Professor,
         [Parameter(Mandatory)][string]$User,
@@ -202,7 +213,7 @@ function Set-ACL {
     $response = Invoke-PVEAPI -Route "access/acl" -Params @{Headers = (Get-AccessTicket); Method = "PUT"; Body = $acl_body} -Silent
 
     if ($response.Response -match "ACL update failed: user '($User@NKU|$Professor@NKU)' does not exist") {
-        Write-Warning "$($response.Response). The user likely has not been synced to the NKU realm."
+        Write-Warning "$($response.Response). The user likely has not been synced to the NKU realm or does not exist in AD."
     }
     elseif (($response.StatusCode) -and ($response.StatusCode -ne 200)) {
         Write-Warning "Failed to set ACL for $($User): $($response.StatusCode)"
@@ -212,7 +223,7 @@ function Set-ACL {
     }
 }
 
-function Clone-ClassVMs {
+function Clone-PVEClassVMs {
     Param (
         [Parameter(Mandatory)][string]$Class,
         [string]$CustomRosterPath = $null
@@ -252,7 +263,7 @@ function Clone-ClassVMs {
                 Write-Host "Retrying once..." -ForegroundColor White
                 #Invoke-PVEAPI -Route "nodes/$node/qemu/$($template.vmid)/clone" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body = $body} -ErrorBehavior "Stop"
             }
-            Set-ACL -Professor $professor -User $user -ID $vm_id
+            Set-ProxmoxACL -Professor $professor -User $user -ID $vm_id
             $vm_id++
         }
     }
@@ -262,8 +273,8 @@ function Clone-ClassVMs {
 #Get-AccessTicket
 
 #Clone-ClassVMs -Class "CIT 171-001" -CustomRosterPath "$HOME\Documents\custom.csv"
-$vm = Invoke-PVEAPI -Route "nodes/COIVMHOST1/qemu/129/clone" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body = @{newid=374;node="COIVMHOST1";vmid=129;pool="CYS999-001";description=$markdown}}
-$vm
-#Set-ACL -Professor "poet2" -User "devorez1" -ID 374
+#$vm = Invoke-PVEAPI -Route "nodes/COIVMHOST1/qemu/129/clone" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body = @{newid=374;node="COIVMHOST1";vmid=129;pool="CYS999-001";full=1;snapname="day1"}}
+#$vm
+#Set-ProxmoxACL -Professor "poet2" -User "devorez1" -ID 374
 
 #Create-Pool -id "test"
