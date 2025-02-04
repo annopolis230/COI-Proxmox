@@ -141,14 +141,15 @@ function Create-Pool {
     }
 }
 function Get-NextNode {
+    # Round robin load balancing. Not a perfect solution: Doesn't take into account VM/cluster performance at all, but it provides a basic level of load balancing
     Param (
-        [Parameter(Mandatory)][int]$LastIndex
+        [Parameter(Mandatory)][int]$LastIndex,
+		[Parameter(Mandatory)][object]$nodes
     )
 
-    # Return the next node to use in a circular fashion. This is just round robin load balancing. 
-    $nodes = @("COIVMHOST1", "COIVMHOST2", "COIVMHOST3", "COIVMHOST4")
     $next_index = ($LastIndex + 1) % $nodes.length
 
+    # Return the next node to use and the index of that node in the $nodes array. This will loop around the array, going back to 0 after the last has been used.
     return $nodes[$next_index], $next_index
 }
 
@@ -223,28 +224,85 @@ function Set-ProxmoxACL {
     }
 }
 
+function Sync-Realm {
+    Param (
+        [Parameter(Mandatory)][object]$Students,
+        [Parameter(Mandatory)][string]$Professor
+    )
+
+    $students_group = Get-ADGroupMember -Identity "Proxmox_Students" -Credential $cred | Select -ExpandProperty Name
+    $faculty_group = Get-ADGroupMember -Identity "Proxmox_Faculty" -Credential $cred | Select -ExpandProperty Name
+	$admin_group = Get-ADGroupMember -Identity "Proxmox_Admins" -Credential $cred | Select -ExpandProperty Name
+
+    # To avoid sync issues we check if the user or professor are already in the designated Proxmox group or the Proxmox_Admins group
+    if ((-not ($Professor -in $faculty_group)) -and (-not ($Professor -in $admin_group))) {
+        Write-Host "Adding professor $Professor to Proxmox_Faculty AD group"
+
+        # If this fails, it will cause every later ACL update to fail because the professor gets added to every VM. So no error handling here.
+        Add-ADGroupMember -Identity "Proxmox_Faculty" -Members $Professor -ErrorAction Stop -Credential $cred 
+    }
+
+    foreach ($user in $Students) {
+        # The only reason a student should be in the Proxmox_Admins group is if they're a student worker
+        if ((-not ($user -in $students_group)) -and (-not ($user -in $admin_group))) {
+            try {
+                Add-ADGroupMember -Identity "Proxmox_Students" -Members $user -ErrorAction Stop -Credential $cred 
+            }
+            catch {
+                Write-Host "Failed to add $user to Proxmox_Students AD group. This will likely cause a failure when updating their VM permissions."
+            }
+        }
+    }
+
+    # Once the relevant AD groups are updated we can proceed with the realm sync against the LDAP query:
+    # (|(memberOf=CN=Proxmox_Admins,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu)(memberOf=CN=Proxmox_Faculty,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu)(memberOf=CN=Proxmox_Students,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu))
+    $payload = @{
+        Headers = (Get-AccessTicket)
+        Method = "POST"
+        Body = @{
+            "realm" = "NKU"
+            "enable-new" = 1
+            "scope" = "both"
+            "remove-vanished" = "acl;properties;entry"
+        }
+    }
+
+    #Invoke-PVEAPI -Route "access/domains/NKU/sync" -Params $payload -ErrorBehavior "Stop"
+}
+
 function Clone-PVEClassVMs {
     Param (
         [Parameter(Mandatory)][string]$Class,
         [string]$CustomRosterPath = $null
     )
 
+    # STEP 1: Gather a list of students and the professor for the given class
     $class_roster = Get-ClassRoster -Class $Class -Path $CustomRosterPath
     $student_list, $professor = $class_roster[0], $class_roster[1]
     $users = @($student_list) + $professor
 
+    # STEP 2: Initialize vm_id to be the current highest vm_id + 1. These need to be unique for every VM.
+    # WARNING: This is NOT designed to be used concurrently, and could potentially introduce issues if more than one person is using this function at once.
     $current_vms = Invoke-PVEAPI -Route "nodes/COIVMHOST1/qemu" -Params @{Headers = (Get-AccessTicket); Method="GET"}
     $vm_id = ($current_vms.data | Select -ExpandProperty vmid | Sort)[-1] + 1
 
+    # STEP 3: Create a pool for the new VMs
     $pool_id = $Class -replace ' ', ''
     Create-Pool -id $pool_id
 
+    # STEP 4: Get an array containing each in-use host in the cluster, initialize the index of this array to -1 because the Get-NextNode function will increment it.
+    $nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
     $last_index = -1
+
+    # STEP 5: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
+    #Sync-Realm -Students $student_list -Professor $professor
+
+    # STEP 6: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
     foreach ($template in (Get-Templates -Class $Class)) {
         Write-Host "Cloning from template $($template.name);$($template.vmid)..." -BackgroundColor White -ForegroundColor Black
 
         foreach ($user in $users) {
-            $node, $last_index = Get-NextNode $last_index
+            $node, $last_index = get-nextnode -LastIndex $last_index -nodes $nodes
             #$name = "$($pool_id)-$($user)-$($template.name -replace '.*\d+','')"
             Write-Host "Creating VM for $user with ID $vm_id on host $node"
 
@@ -254,16 +312,17 @@ function Clone-PVEClassVMs {
                 vmid = $template.vmid
                 pool = $pool_id
                 full = 1
-                snapname = "Day1"
                 #name = $name
             }
+            $body
             #$vm = Invoke-PVEAPI -Route "nodes/$node/qemu/$($template.vmid)/clone" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body = $body}
 
             if ($vm.Error) {
                 Write-Host "Retrying once..." -ForegroundColor White
                 #Invoke-PVEAPI -Route "nodes/$node/qemu/$($template.vmid)/clone" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body = $body} -ErrorBehavior "Stop"
             }
-            Set-ProxmoxACL -Professor $professor -User $user -ID $vm_id
+            Write-Host "Setting access control list for $vm_id..."
+            #Set-ProxmoxACL -Professor $professor -User $user -ID $vm_id
             $vm_id++
         }
     }
@@ -273,7 +332,7 @@ function Clone-PVEClassVMs {
 #Get-AccessTicket
 
 #Clone-ClassVMs -Class "CIT 171-001" -CustomRosterPath "$HOME\Documents\custom.csv"
-#$vm = Invoke-PVEAPI -Route "nodes/COIVMHOST1/qemu/129/clone" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body = @{newid=374;node="COIVMHOST1";vmid=129;pool="CYS999-001";full=1;snapname="day1"}}
+#$vm = Invoke-PVEAPI -Route "nodes/COIVMHOST1/qemu/129/clone" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body = @{newid=374;node="COIVMHOST1";vmid=129;pool="CYS999-001";full=1}}
 #$vm
 #Set-ProxmoxACL -Professor "poet2" -User "devorez1" -ID 374
 
