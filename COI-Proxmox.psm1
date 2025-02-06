@@ -55,6 +55,7 @@ function Invoke-PVEAPI {
         if (($response.StatusCode -ne 200) -and ($response.StatusCode -ne 201)) {
             throw [ApiException]::new("Request failed", $response.StatusCode, $response.StatusDescription)
         }
+        # Convert the JSON response into a PowerShell object
         $to_return = $response.Content | ConvertFrom-Json
     }
     # The goal is to return something even if the request fails so the calling function can decide what to do on failure
@@ -64,7 +65,11 @@ function Invoke-PVEAPI {
         if (-not $Silent) {Write-Warning "$($_.Exception.Message) to route $($route) with method $($Params.Method)"}
 
         if ($_.Exception.Response.StatusCode.value__) {
-            $to_return = @{Error = $true; StatusCode = $_.Exception.Response.StatusCode.value__; Response = $_.Exception.Response.StatusDescription}
+            $to_return = @{
+                Error = $true
+                StatusCode = $_.Exception.Response.StatusCode.value__
+                Response = $_.Exception.Response.StatusDescription
+            }
         }
         else {
             $to_return = @{Error = $true}
@@ -73,10 +78,13 @@ function Invoke-PVEAPI {
     catch [ApiException] {
         if (-not $Silent) {Write-Warning "$($_.Exception.Message) to route $($route) with method $($Params.Method)"}
         $err = $true
-        $to_return = @{StatusCode = $_.Exception.StatusCode; Error = $true}
+        $to_return = @{
+            StatusCode = $_.Exception.StatusCode
+            Error = $true
+        }
     }
 
-    # The ErrorBehavior flag overrides the default behavior of returning something on failure and just throws an error. This is useful for when the program shouldn't continue if later processing requires certain data/objects to exist in Proxmox
+    # The ErrorBehavior flag overrides the default behavior of returning something on failure and just throws an error. This is useful for when the program shouldn't continue if later processing requires certain prereq data or for objects to exist in Proxmox
     if ((-not $err) -or ($ErrorBehavior -eq "Continue")) {
         return $to_return
     }
@@ -92,6 +100,7 @@ function Get-AccessTicket {
         $Credentials = (Get-Credential -Credential "da_$env:USERNAME")
         $Vars.Credentials = $Credentials
 
+        # Obtain the session ticket and CSRF prevention token
         $ticket = Invoke-PVEAPI -Route "access/ticket" -ErrorBehavior "Stop" -Params @{
             Method = "POST"
             Body = @{
@@ -307,7 +316,7 @@ function Set-ClassTA {
         Write-Host "TA $user not synced with Proxmox realm. Syncing now..." -ForegroundColor Yellow
         try {
             Get-ADUser -Identity $User
-            #Sync-Realm -Students $User
+            Sync-Realm -Students $User
         }
         catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
             Write-Host "User $User does not exist in AD" -BackgroundColor Red -ForegroundColor Black
@@ -356,14 +365,16 @@ function Set-ProxmoxACL {
         [Parameter(Mandatory)][string]$ID
     )
 
-    $acl_body = @{
-        path = "/vms/$id"
-        users = "$user@NKU,$professor@NKU"
-        roles = "Faculty-Students"
-    }
-
     # Update the access control list to include student/professor permissions for a VM.
-    $response = Invoke-PVEAPI -Route "access/acl" -Params @{Headers = (Get-AccessTicket); Method = "PUT"; Body = $acl_body} -Silent
+    $response = Invoke-PVEAPI -Route "access/acl" -Params @{
+        Headers = (Get-AccessTicket)
+        Method = "PUT"
+        Body = @{
+            path = "/vms/$id"
+            users = "$user@NKU,$professor@NKU"
+            roles = "Faculty-Students"
+        }
+    } -Silent
 
     if ($response.Response -match "ACL update failed: user '($User@NKU|$Professor@NKU)' does not exist") {
         Write-Warning "$($response.Response). The user likely has not been synced to the NKU realm or does not exist in AD."
@@ -448,7 +459,7 @@ function Clone-PVEClassVMs {
     $last_index = -1
 
     # STEP 4: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
-    #Sync-Realm -Students $student_list -Professor $professor
+    Sync-Realm -Students $student_list -Professor $professor
 
     # STEP 5: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
     foreach ($template in (Get-Templates -Class $Class)) {
@@ -464,7 +475,7 @@ function Clone-PVEClassVMs {
                 Professor = $Professor
                 User = $user
             }
-            #$vm = Clone-VM -TemplateID $template.vmid -Node $node -Pool $pool_id -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl -SkipTagConfiguration:$SkipTagConfiguration
+            $vm = Clone-VM -TemplateID $template.vmid -Node $node -Pool $pool_id -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl -SkipTagConfiguration:$SkipTagConfiguration
             
             if ($vm.Error) {
                 Write-Warning "Failed to create VM $name; $($vm.Response)"
