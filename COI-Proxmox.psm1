@@ -18,6 +18,10 @@ $AllProtocols = [System.Net.SecurityProtocolType]'Ssl3,Tls,Tls11,Tls12'
 [System.Net.ServicePointManager]::SecurityProtocol = $AllProtocols
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 
+$Script:Vars = @{
+    Credentials = $null
+}
+
 class ApiException : System.Exception {
     [int]$StatusCode
     [string]$response
@@ -85,8 +89,10 @@ function Get-AccessTicket {
     # To prevent re-authenticating within the same PowerShell session, the access ticket and CSRF token are stored in (ephemeral) environment variables
     # Note that tickets only last for 2 hours. So it might be possible that someone leaves a terminal open and tries to clone VMs again, only to be met with 401 errors. If that happens just restart the terminal.
     if (-not ($env:ACCESS_TICKET -and $env:CSRF_TOKEN)) {
-        $Credentials = (Get-Credential -Credential $env:USERNAME)
-        $params = @{
+        $Credentials = (Get-Credential -Credential "da_$env:USERNAME")
+        $Vars.Credentials = $Credentials
+
+        $ticket = Invoke-PVEAPI -Route "access/ticket" -ErrorBehavior "Stop" -Params @{
             Method = "POST"
             Body = @{
                 username = $Credentials.UserName
@@ -95,7 +101,6 @@ function Get-AccessTicket {
             }
         }
 
-        $ticket = Invoke-PVEAPI -Route "access/ticket" -Params $params -ErrorBehavior "Stop"
         if ($ticket.data.ticket -and $ticket.data.CSRFPreventionToken) {
             $env:ACCESS_TICKET = "PVEAuthCookie=$($ticket.data.ticket)"
             $env:CSRF_TOKEN = $ticket.data.CSRFPreventionToken
@@ -153,6 +158,92 @@ function Get-NextNode {
     return $nodes[$next_index], $next_index
 }
 
+function Clone-VM {
+    Param (
+        [Parameter(Mandatory)][int]$ID,
+        [Parameter(Mandatory)][int]$TemplateID,
+        [Parameter(Mandatory)][string]$Node,
+        [Parameter(Mandatory)][string]$Pool,
+        [Parameter(Mandatory)][string]$TemplateNode,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][hashtable]$ACL,
+        [switch]$SkipTagConfiguration
+    )
+
+    # Check if the VM already exists before cloning it
+    $vms = (Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{Headers = (Get-AccessTicket)}).data
+    $does_exist = [bool]($vms | ? {$_.name -eq $name})
+
+    if ($does_exist) {
+        Write-Warning "VM $name already exists. Skipping..."
+        return $null
+    }
+
+    # Clone the VM
+    Write-Host "[+] Creating $Name with ID $ID on host $Node" -ForegroundColor Green
+    $vm = Invoke-PVEAPI -Route "nodes/$TemplateNode/qemu/$TemplateID/clone" -Params @{
+        Headers = (Get-AccessTicket)
+        Method = "POST" 
+        Body = @{
+            newid = $ID
+            node = $TemplateNode
+            vmid = $TemplateID
+            pool = $Pool
+            target = $Node
+            name = $name
+            full = 1
+        }
+    }
+
+    # The Proxmox API is asynchronous, which is overall good. But there's also not any callbacks or event driven ways to check if a VM is actually done cloning before proceeding.
+    # So the best option is to simply poll the API every few seconds to see if its done or not. 
+    # If the VMs aren't done before the next step which is to configure the tags, that API call will fail.
+
+    if (-not $SkipTagConfiguration) {
+        $encoded_parameters = [System.Net.WebUtility]::UrlEncode($vm.data)
+        $complete = $false
+        $timeout_seconds = 45
+        $start_time = Get-Date
+    
+        Write-Host "    Waiting for VM to finish..." -ForegroundColor Gray
+        do {
+            if ((Get-Date) - $start_time -gt (New-TimeSpan -Seconds $timeout_seconds)) {
+                Write-Warning "Timeout for VM clone exceeded for $name. Tag configuration will likely fail."
+                break
+            }
+    
+            $status = Invoke-PVEAPI -Route "nodes/$TemplateNode/tasks/$encoded_parameters/status" -Params @{
+                Method = "GET"
+                Headers = (Get-AccessTicket)
+            } -Silent
+    
+            if ($status.data.status -eq "stopped") {
+                write-host "    [+] Done" -ForegroundColor Green
+                $complete = $true
+            }
+            else {
+                Start-Sleep 3
+            }
+        }
+        while (-not $complete)
+
+        # Configure the tags
+        Invoke-PVEAPI -Route "nodes/$Node/qemu/$ID/config" -Params @{
+            Headers = (Get-AccessTicket)
+            Method = "POST"
+            Body = @{
+                node = $Node
+                vmid = $ID
+                tags = $Pool
+            }
+        }
+    }
+
+    # Configure the access control list
+    Set-ProxmoxACL -Professor $ACL.Professor -User $ACL.User -ID $ID
+    return $vm
+}
+
 # -------- Exported Functions --------
 
 function Get-PVEClassRoster {
@@ -197,31 +288,6 @@ function Get-Templates {
     return $template_list
 }
 
-function Clone-VM {
-    Param (
-        [Parameter(Mandatory)][int]$ID,
-        [Parameter(Mandatory)][int]$TemplateID,
-        [Parameter(Mandatory)][string]$Node,
-        [Parameter(Mandatory)][string]$Pool,
-        [Parameter(Mandatory)][string]$TemplateNode
-    )
-
-    Write-Host "[+] Creating VM with ID $ID on host $Node" -ForegroundColor Green
-    $vm = Invoke-PVEAPI -Route "nodes/$TemplateNode/qemu/$TemplateID/clone" -Params @{
-        Headers = (Get-AccessTicket)
-        Method = "POST" 
-        Body = @{
-            newid = $ID
-            node = $TemplateNode
-            vmid = $TemplateID
-            pool = $Pool
-            target = $Node
-            full = 1
-        }
-    }
-    return $vm
-}
-
 function Set-ClassTA {
     Param (
         [Parameter(Mandatory)][string]$User,
@@ -252,20 +318,6 @@ function Set-ClassTA {
     $professor = (Get-PVEClassRoster -Class $Class)[1]
     $pool_id = $Class -replace ' ', ''
 
-    if ($CloneVM) {
-        $nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
-        $last_index = -1
-        foreach ($template in (Get-Templates -Class $Class)) {
-            [int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket)}).data
-            Write-Host "Cloning from template $($template.name); $($template.vmid); $($template.node)..." -BackgroundColor White -ForegroundColor Black
-
-            $node, $last_index = Get-NextNode -LastIndex $last_index -nodes $nodes
-            Clone-VM -TemplateID $template.vmid -Node $node -Pool $pool_id -ID $vm_id -TemplateNode $template.node | Out-Null
-
-            Set-ProxmoxACL -Professor $professor -User $User -ID $vm_id
-        }
-    }
-
     # Get all VMs in the class
     $pool_members = (Invoke-PVEAPI -Route "pools" -Params @{
         Headers = (Get-AccessTicket)
@@ -276,6 +328,24 @@ function Set-ClassTA {
 
     foreach ($id in $pool_members) {
         Set-ProxmoxACL -Professor $professor -User $User -ID $id
+    }
+
+    if ($CloneVM) {
+        $nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
+        $last_index = -1
+        foreach ($template in (Get-Templates -Class $Class)) {
+            [int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket)}).data
+            Write-Host "Cloning from template $($template.name); $($template.vmid); $($template.node)..." -BackgroundColor White -ForegroundColor Black
+
+            $name = "$($pool_id)-$($User)-$($template.name.Split('-')[-1])"
+            $node, $last_index = Get-NextNode -LastIndex $last_index -nodes $nodes
+
+            $acl = @{
+                Professor = $professor
+                User = $User
+            }
+            Clone-VM -TemplateID $template.vmid -Node $node -Pool $pool_id -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl | Out-Null
+        }
     }
 }
 
@@ -302,7 +372,7 @@ function Set-ProxmoxACL {
         Write-Warning "Failed to set ACL for $($User): $($response.StatusCode)"
     }
     else {
-        Write-Host "[+] ACL set for $ID; $User, $Professor" -ForegroundColor Gray
+        Write-Host "    [+] ACL set for $ID; $User, $Professor" -ForegroundColor Green
     }
 }
 
@@ -311,6 +381,10 @@ function Sync-Realm {
         [Parameter(Mandatory)][object]$Students,
         [string]$Professor
     )
+
+    if (-not $Vars.Credentials) {
+        $Vars.Credentials = (Get-Credentials -Credential "da_$env:USERNAME")
+    }
 
     $students_group = Get-ADGroupMember -Identity "Proxmox_Students" -Credential $cred | Select -ExpandProperty Name
     $faculty_group = Get-ADGroupMember -Identity "Proxmox_Faculty" -Credential $cred | Select -ExpandProperty Name
@@ -356,7 +430,8 @@ function Sync-Realm {
 function Clone-PVEClassVMs {
     Param (
         [Parameter(Mandatory)][string]$Class,
-        [string]$CustomRosterPath = $null
+        [string]$CustomRosterPath = $null,
+        [switch]$SkipTagConfiguration
     )
 
     # STEP 1: Gather a list of students and the professor for the given class
@@ -383,15 +458,16 @@ function Clone-PVEClassVMs {
             # Get the next available VM ID and the next node to use
             [int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket)}).data
             $node, $last_index = Get-NextNode -LastIndex $last_index -nodes $nodes
+            $name = "$($pool_id)-$($user)-$($template.name.Split('-')[-1])"
 
-            #$name = "$($pool_id)-$($user)-$($template.name -replace '.*\d+','')"
-            #$vm = Clone-VM -TemplateID $template.vmid -Node $node -Pool $pool_id -ID $vm_id -TemplateNode $template.node
+            $acl = @{
+                Professor = $Professor
+                User = $user
+            }
+            #$vm = Clone-VM -TemplateID $template.vmid -Node $node -Pool $pool_id -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl -SkipTagConfiguration:$SkipTagConfiguration
             
             if ($vm.Error) {
-                Write-Warning "Failed to create VM for $user with template $($template.name)"
-            }
-            else {
-                #Set-ProxmoxACL -Professor $professor -User $user -ID $vm_id
+                Write-Warning "Failed to create VM $name; $($vm.Response)"
             }
         }
     }
