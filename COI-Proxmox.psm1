@@ -97,15 +97,16 @@ function Get-AccessTicket {
     # To prevent re-authenticating within the same PowerShell session, the access ticket and CSRF token are stored in (ephemeral) environment variables
     # Note that tickets only last for 2 hours. So it might be possible that someone leaves a terminal open and tries to clone VMs again, only to be met with 401 errors. If that happens just restart the terminal.
     if (-not ($env:ACCESS_TICKET -and $env:CSRF_TOKEN)) {
-        $Credentials = (Get-Credential -Credential "da_$env:USERNAME")
-        $Vars.Credentials = $Credentials
+        if (-not $Vars.Credentials) {
+            $Vars.Credentials = (Get-Credential -Credential "da_$env:USERNAME")
+        }
 
         # Obtain the session ticket and CSRF prevention token
         $ticket = Invoke-PVEAPI -Route "access/ticket" -ErrorBehavior "Stop" -Params @{
             Method = "POST"
             Body = @{
-                username = $Credentials.UserName
-                password = $Credentials.GetNetworkCredential().Password
+                username = $Vars.Credentials.UserName
+                password = $Vars.Credentials.GetNetworkCredential().Password
                 realm = "NKU"
             }
         }
@@ -227,7 +228,7 @@ function Clone-VM {
             } -Silent
     
             if ($status.data.status -eq "stopped") {
-                write-host "    [+] Done" -ForegroundColor Green
+                Write-Host "    [+] Done" -ForegroundColor Green
                 $complete = $true
             }
             else {
@@ -316,7 +317,7 @@ function Set-ClassTA {
         Write-Host "TA $user not synced with Proxmox realm. Syncing now..." -ForegroundColor Yellow
         try {
             Get-ADUser -Identity $User
-            Sync-Realm -Students $User
+            Sync-Realm -Students $User | Out-Null
         }
         catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
             Write-Host "User $User does not exist in AD" -BackgroundColor Red -ForegroundColor Black
@@ -394,12 +395,12 @@ function Sync-Realm {
     )
 
     if (-not $Vars.Credentials) {
-        $Vars.Credentials = (Get-Credentials -Credential "da_$env:USERNAME")
+        $Vars.Credentials = (Get-Credential -Credential "da_$env:USERNAME")
     }
 
-    $students_group = Get-ADGroupMember -Identity "Proxmox_Students" -Credential $cred | Select -ExpandProperty Name
-    $faculty_group = Get-ADGroupMember -Identity "Proxmox_Faculty" -Credential $cred | Select -ExpandProperty Name
-	$admin_group = Get-ADGroupMember -Identity "Proxmox_Admins" -Credential $cred | Select -ExpandProperty Name
+    $students_group = Get-ADGroupMember -Identity "Proxmox_Students" -Credential $Vars.Credentials | Select -ExpandProperty Name
+    $faculty_group = Get-ADGroupMember -Identity "Proxmox_Faculty" -Credential $Vars.Credentials | Select -ExpandProperty Name
+	$admin_group = Get-ADGroupMember -Identity "Proxmox_Admins" -Credential $Vars.Credentials | Select -ExpandProperty Name
 
     # To avoid sync issues we check if the user or professor are already in the designated Proxmox group or the Proxmox_Admins group
     if ($Professor) {
@@ -407,7 +408,7 @@ function Sync-Realm {
             Write-Host "Adding professor $Professor to Proxmox_Faculty AD group"
     
             # If this fails, it will cause every later ACL update to fail because the professor gets added to every VM. So no error handling here.
-            Add-ADGroupMember -Identity "Proxmox_Faculty" -Members $Professor -ErrorAction Stop -Credential $cred 
+            Add-ADGroupMember -Identity "Proxmox_Faculty" -Members $Professor -ErrorAction Stop -Credential $Vars.Credentials 
         }
     }
 
@@ -415,10 +416,10 @@ function Sync-Realm {
         # The only reason a student should be in the Proxmox_Admins group is if they're a student worker
         if ((-not ($user -in $students_group)) -and (-not ($user -in $admin_group))) {
             try {
-                Add-ADGroupMember -Identity "Proxmox_Students" -Members $user -ErrorAction Stop -Credential $cred 
+                Add-ADGroupMember -Identity "Proxmox_Students" -Members $user -ErrorAction Stop -Credential $Vars.Credentials
             }
-            catch {
-                Write-Host "Failed to add $user to Proxmox_Students AD group. This will likely cause a failure when updating their VM permissions."
+            catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException]{
+                Write-Host "Failed to add $user to Proxmox_Students AD group. They do not exist in AD. This will likely cause a failure when updating their VM permissions."
             }
         }
     }
@@ -426,6 +427,7 @@ function Sync-Realm {
     # Once the relevant AD groups are updated we can proceed with the realm sync against the LDAP query:
     # (|(memberOf=CN=Proxmox_Admins,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu)(memberOf=CN=Proxmox_Faculty,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu)(memberOf=CN=Proxmox_Students,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu))
 
+    Write-Host "Syncing realm..." -ForegroundColor Green
     Invoke-PVEAPI -Route "access/domains/NKU/sync" -ErrorBehavior "Stop" -Params @{
         Headers = (Get-AccessTicket)
         Method = "POST"
@@ -459,7 +461,7 @@ function Clone-PVEClassVMs {
     $last_index = -1
 
     # STEP 4: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
-    Sync-Realm -Students $student_list -Professor $professor
+    Sync-Realm -Students $student_list -Professor $professor | Out-Null
 
     # STEP 5: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
     foreach ($template in (Get-Templates -Class $Class)) {
