@@ -101,7 +101,7 @@ function Invoke-PVEAPI {
 }
 
 function Get-AccessTicket {
-    # To prevent re-authenticating within the same PowerShell session, the access ticket and CSRF token are stored in (ephemeral) environment variables
+    # To prevent re-authenticating within the same PowerShell session, the access ticket and CSRF token are stored in shell variables
     # Note that tickets only last for 2 hours. So it might be possible that someone leaves a terminal open and tries to clone VMs again, only to be met with 401 errors. If that happens just restart the terminal.
     if (-not ($env:ACCESS_TICKET -and $env:CSRF_TOKEN)) {
         if (-not $Vars.Credentials) {
@@ -214,7 +214,7 @@ function New-VirtualNetwork {
 		[Parameter(Mandatory)][string]$Alias
 	)
 
-	Write-Host "    [+] Creating new VNET bound to $($VXLAN.zone)" -ForegroundColor Green
+	Write-Host "    [+] Creating new VNET bound to $($VXLAN.zone); Alias: $Alias" -ForegroundColor Green
 	$vnet_config = @{
 		"vnet" = $ID
 		"zone" = $VXLAN.zone
@@ -647,6 +647,7 @@ function Clone-ProxmoxClassVMs {
 
     # STEP 4: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
 	foreach ($user in $users) {
+        Write-Host "------- Starting config for $user -------" -ForegroundColor Magenta
 		Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class)
 	}
 }
