@@ -36,6 +36,13 @@ class ApiException : System.Exception {
     }
 }
 
+function Get-DAUser {
+	if (($env:USERNAME).StartsWith("da_")) {
+		return $env:USERNAME
+	}
+	return "da_$env:USERNAME"
+}
+
 function Invoke-PVEAPI {
     Param (
         [Parameter(Mandatory)][string]$Route,
@@ -98,7 +105,7 @@ function Get-AccessTicket {
     # Note that tickets only last for 2 hours. So it might be possible that someone leaves a terminal open and tries to clone VMs again, only to be met with 401 errors. If that happens just restart the terminal.
     if (-not ($env:ACCESS_TICKET -and $env:CSRF_TOKEN)) {
         if (-not $Vars.Credentials) {
-            $Vars.Credentials = (Get-Credential -Credential "da_$env:USERNAME")
+            $Vars.Credentials = (Get-Credential -Credential (Get-DAUser))
         }
 
         # Obtain the session ticket and CSRF prevention token
@@ -155,6 +162,7 @@ function Create-Pool {
         }
     }
 }
+
 function Get-NextNode {
     # Round robin load balancing. Not a perfect solution: Doesn't take into account VM/cluster performance at all, but it provides a basic level of load balancing
     Param (
@@ -168,90 +176,124 @@ function Get-NextNode {
     return $nodes[$next_index], $next_index
 }
 
-function Clone-VM {
-    Param (
-        [Parameter(Mandatory)][int]$ID,
-        [Parameter(Mandatory)][int]$TemplateID,
-        [Parameter(Mandatory)][string]$Node,
-        [Parameter(Mandatory)][string]$Pool,
-        [Parameter(Mandatory)][string]$TemplateNode,
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][hashtable]$ACL,
-        [switch]$SkipTagConfiguration
-    )
+function New-VXLAN {
+	Param (
+		[Parameter(Mandatory)][string]$ID
+	)
 
-    # Check if the VM already exists before cloning it
-    $vms = (Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{Headers = (Get-AccessTicket)}).data
-    $does_exist = [bool]($vms | ? {$_.name -eq $name})
+	$cluster = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data)
+	$nodes = @($cluster | Select -ExpandProperty name) -join ","
+	$peers = @($cluster | Select -ExpandProperty ring0_addr) -join ","
+	$vxlan_config = @{
+		"type" = "vxlan"
+		"zone" = $ID
+		"peers" = $peers
+		"mtu" = 1450
+		"nodes" = $nodes
+		"ipam" = "pve"
+	}
+	
+	Write-Host "    [+] Creating new VXLAN with ID $ID" -ForegroundColor Green
+	$net = Invoke-PVEAPI -Route "cluster/sdn/zones" -Params @{
+		Headers = (Get-AccessTicket)
+		Method = "POST"
+		Body = $vxlan_config
+	}
+	
+	if ($net.Error) {
+		Write-Warning "Failed to create a new VXLAN with ID $ID. $($net.Response)"
+		return $null
+	}
+	return $vxlan_config
+}
 
-    if ($does_exist) {
-        Write-Warning "VM $name already exists. Skipping..."
-        return $null
-    }
+function New-VirtualNetwork {
+	Param (
+		[Parameter(Mandatory)][hashtable]$VXLAN,
+		[Parameter(Mandatory)][string]$ID,
+		[Parameter(Mandatory)][string]$Alias
+	)
 
-    # Clone the VM
-    Write-Host "[+] Creating $Name with ID $ID on host $Node" -ForegroundColor Green
-    $vm = Invoke-PVEAPI -Route "nodes/$TemplateNode/qemu/$TemplateID/clone" -Params @{
-        Headers = (Get-AccessTicket)
-        Method = "POST" 
-        Body = @{
-            newid = $ID
-            node = $TemplateNode
-            vmid = $TemplateID
-            pool = $Pool
-            target = $Node
-            name = $name
-            full = 1
-        }
-    }
+	Write-Host "    [+] Creating new VNET bound to $($VXLAN.zone)" -ForegroundColor Green
+	$vnet_config = @{
+		"vnet" = $ID
+		"zone" = $VXLAN.zone
+		"alias" = $Alias
+		"tag" = [int]($ID.Trim("v"))
+	}
+	$net = Invoke-PVEAPI -Route "cluster/sdn/vnets" -Params @{
+		Headers = (Get-AccessTicket)
+		Method = "POST"
+		Body = $vnet_config
+	}
+	
+	if ($net.Error) {
+		Write-Warning "Failed to create a new VNET with ID $ID bound to $($VXLAN.zone). $($net.Response)"
+		return $null
+	}
+	return $vnet_config
+}
 
-    # The Proxmox API is asynchronous, which is overall good. But there's also not any callbacks or event driven ways to check if a VM is actually done cloning before proceeding.
-    # So the best option is to simply poll the API every few seconds to see if its done or not. 
-    # If the VMs aren't done before the next step which is to configure the tags, that API call will fail.
-
-    if (-not $SkipTagConfiguration) {
-        $encoded_parameters = [System.Net.WebUtility]::UrlEncode($vm.data)
-        $complete = $false
-        $timeout_seconds = 45
-        $start_time = Get-Date
-    
-        Write-Host "    Waiting for VM to finish..." -ForegroundColor Gray
-        do {
-            if ((Get-Date) - $start_time -gt (New-TimeSpan -Seconds $timeout_seconds)) {
-                Write-Warning "Timeout for VM clone exceeded for $name. Tag configuration will likely fail."
-                break
-            }
-    
-            $status = Invoke-PVEAPI -Route "nodes/$TemplateNode/tasks/$encoded_parameters/status" -Params @{
-                Method = "GET"
-                Headers = (Get-AccessTicket)
-            } -Silent
-    
-            if ($status.data.status -eq "stopped") {
-                Write-Host "    [+] Done" -ForegroundColor Green
-                $complete = $true
-            }
-            else {
-                Start-Sleep 3
-            }
-        }
-        while (-not $complete)
-
-        # Configure the tags
-        Invoke-PVEAPI -Route "nodes/$Node/qemu/$ID/config" -Params @{
-            Headers = (Get-AccessTicket)
-            Method = "POST"
-            Body = @{
-                node = $Node
-                vmid = $ID
-                tags = $Pool
-            }
-        }
-    }
-
-    # Configure the access control list
-    Set-ProxmoxACL -Professor $ACL.Professor -User $ACL.User -ID $ID
-    return $vm
+function Set-SDN {
+	Param (
+		[Parameter(Mandatory)][string]$SDN,
+		[Parameter(Mandatory)][string]$Node,
+		[Parameter(Mandatory)][object]$VNETs,
+		[Parameter(Mandatory)][int]$VM_ID,
+		[switch]$Router
+	)
+	
+	function Get-MacAddress {
+		Param (
+			[Parameter(Mandatory)][string]$Interface
+		)
+		
+		$config = (invoke-pveapi -route "nodes/$Node/qemu/$VM_ID/config" -Params @{
+			Headers = (Get-AccessTicket)
+			Method = "GET"
+		}).data | Select $Interface
+		
+		return ($config.$Interface).Split(',')[0].Split('=')[1]
+	}
+	
+	$Body = @{
+		node = $Node
+		vmid = $VM_ID
+	}
+	
+	if ($VNETs.length -eq 0) {
+		Write-Warning "FATAL: Could not apply SDN $SDN to $VM_ID; No VNET specified!"
+		return $null
+	}
+	elseif ($VNETs.length -eq 1) {
+		$vnet = $VNETs
+		if ($Router) {
+			$Body["net1"] = "virtio=$(Get-MacAddress -Interface "net1"),bridge=$($vnet.vnet),mtu=1"
+		}
+		else {
+			$Body["net0"] = "virtio=$(Get-MacAddress -Interface "net0"),bridge=$($vnet.vnet),mtu=1"
+		}
+	}
+	elseif ($VNETs.length -eq 2) {
+		if ($Router) {
+			$internal_bridge = $VNETs | ? {$_.alias -match "internal"}
+			$dmz_bridge = $VNETs | ? {$_.alias -match "dmz"}
+			$Body["net1"] = "virtio=$(Get-MacAddress -Interface "net1"),bridge=$($internal_bridge.vnet),mtu=1"
+			$Body["net2"] = "virtio=$(Get-MacAddress -Interface "net2"),bridge=$($dmz_bridge.vnet),mtu=1"
+		}
+		else {
+			$bridge = $VNETs | ? {$_.alias -match $SDN}
+			$Body["net0"] = "virtio=$(Get-MacAddress -Interface "net0"),bridge=$($bridge.vnet),mtu=1"
+		}
+	}
+	
+	Invoke-PVEAPI -Route "nodes/$Node/qemu/$VM_ID/config" -Params @{
+		Headers = (Get-AccessTicket)
+		Method = "POST"
+		Body = $Body
+	} | Out-Null
+	
+	Write-Host "    [+] SDN set for $VM_ID; $SDN" -ForegroundColor Green
 }
 
 # -------- Exported Functions --------
@@ -294,6 +336,17 @@ function Get-Templates {
     $Class = $Class.Split("-")[0] -replace ' ',''
     $data = Invoke-PVEAPI -Route "pools/Templates" -Params @{Headers = (Get-AccessTicket); Method="GET"} -ErrorBehavior "Stop"
     $template_list = @($data.data.members | ? {$_.name -match $Class} | Select name,vmid,node)
+	$template_list | % {$_ | Add-Member -MemberType NoteProperty -Name "SDN" -value $false}
+	
+	foreach ($template in $template_list) {
+		$config = Invoke-PVEAPI -Route "nodes/$($template.node)/qemu/$($template.vmid)/config" -Params @{Headers = (Get-AccessTicket); Method="GET"}
+		
+		# An example tag is "internal;router;template". This line just removes "template" and any leading/trailing semicolons from that string.
+		$sdn_tags = (($config.data.tags).Split(';') | ? {$_ -ne "template"}) -join ';'
+		if (-not $sdn_tags -eq "") {
+			$template.SDN = $sdn_tags
+		}
+	}
 
     return $template_list
 }
@@ -316,7 +369,7 @@ function Set-ClassTA {
     if ($config.Response -match "no such user") {
         Write-Host "TA $user not synced with Proxmox realm. Syncing now..." -ForegroundColor Yellow
         try {
-            Get-ADUser -Identity $User
+            Get-ADUser -Identity $User | Out-Null
             Sync-Realm -Students $User | Out-Null
         }
         catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
@@ -341,21 +394,7 @@ function Set-ClassTA {
     }
 
     if ($CloneVM) {
-        $nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
-        $last_index = -1
-        foreach ($template in (Get-Templates -Class $Class)) {
-            [int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket)}).data
-            Write-Host "Cloning from template $($template.name); $($template.vmid); $($template.node)..." -BackgroundColor White -ForegroundColor Black
-
-            $name = "$($pool_id)-$($User)-$($template.name.Split('-')[-1])"
-            $node, $last_index = Get-NextNode -LastIndex $last_index -nodes $nodes
-
-            $acl = @{
-                Professor = $professor
-                User = $User
-            }
-            Clone-VM -TemplateID $template.vmid -Node $node -Pool $pool_id -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl | Out-Null
-        }
+        Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class)
     }
 }
 
@@ -395,7 +434,7 @@ function Sync-Realm {
     )
 
     if (-not $Vars.Credentials) {
-        $Vars.Credentials = (Get-Credential -Credential "da_$env:USERNAME")
+        $Vars.Credentials = (Get-Credential -Credential (Get-DAUser))
     }
 
     $students_group = Get-ADGroupMember -Identity "Proxmox_Students" -Credential $Vars.Credentials | Select -ExpandProperty Name
@@ -440,11 +479,158 @@ function Sync-Realm {
     }
 }
 
-function Clone-PVEClassVMs {
+function Clone-VM {
+    Param (
+        [Parameter(Mandatory)][int]$ID,
+        [Parameter(Mandatory)][int]$TemplateID,
+        [Parameter(Mandatory)][string]$Node,
+        [Parameter(Mandatory)][string]$Pool,
+        [Parameter(Mandatory)][string]$TemplateNode,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][hashtable]$ACL
+    )
+
+    # Check if the VM already exists before cloning it
+    $vms = (Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{Headers = (Get-AccessTicket)}).data
+    $does_exist = [bool]($vms | ? {$_.name -eq $name})
+
+    if ($does_exist) {
+        Write-Warning "VM $name already exists. Skipping..."
+        return $null
+    }
+
+    # Clone the VM
+    Write-Host "[+] Creating $Name with ID $ID on host $Node" -ForegroundColor Green
+    $vm = Invoke-PVEAPI -Route "nodes/$TemplateNode/qemu/$TemplateID/clone" -Params @{
+        Headers = (Get-AccessTicket)
+        Method = "POST" 
+        Body = @{
+            newid = $ID
+            node = $TemplateNode
+            vmid = $TemplateID
+            pool = $Pool
+            target = $Node
+            name = $name
+            full = 1
+        }
+    }
+
+    # The Proxmox API is asynchronous, which is overall good. But there's also not any callbacks or event driven ways to check if a VM is actually done cloning before proceeding.
+    # So the best option is to simply poll the API every few seconds to see if its done or not. 
+    # If the VMs aren't done before the next step which is to configure the tags, that API call will fail.
+
+    $encoded_parameters = [System.Net.WebUtility]::UrlEncode($vm.data)
+    $complete = $false
+    $timeout_seconds = 45
+    $start_time = Get-Date
+    
+    Write-Host "    Waiting for VM to finish..." -ForegroundColor Gray
+    do {
+        if ((Get-Date) - $start_time -gt (New-TimeSpan -Seconds $timeout_seconds)) {
+            Write-Warning "Timeout for VM clone exceeded for $name. Subsequent operations will likely fail."
+            break
+        }
+    
+        $status = Invoke-PVEAPI -Route "nodes/$TemplateNode/tasks/$encoded_parameters/status" -Params @{
+            Method = "GET"
+            Headers = (Get-AccessTicket)
+        } -Silent
+    
+        if ($status.data.status -eq "stopped") {
+            Write-Host "    [+] Done" -ForegroundColor Green
+            $complete = $true
+        }
+        else {
+            Start-Sleep 3
+        }
+    }
+    while (-not $complete)
+
+    # Configure the tags
+	Invoke-PVEAPI -Route "nodes/$Node/qemu/$ID/config" -Params @{
+		Headers = (Get-AccessTicket)
+		Method = "POST"
+		Body = @{
+			node = $Node
+			vmid = $ID
+			tags = $Pool
+        }
+    }
+
+    # Configure the access control list
+    Set-ProxmoxACL -Professor $ACL.Professor -User $ACL.User -ID $ID
+	
+    return $vm
+}
+
+function Clone-UserVMs {
+	Param (
+		[Parameter(Mandatory)][string]$User,
+		[Parameter(Mandatory)][string]$Professor,
+		[Parameter(Mandatory)][string]$Pool,
+		[Parameter(Mandatory)][object]$Templates
+	)
+	
+	$last_index = -1
+	$Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
+	$sdn_required = $Templates.SDN -match "router"
+	$vnets = @()
+	
+	if ($sdn_required) {
+		Write-Host "Configuring SDN(s) for $User" -ForegroundColor Black -BackgroundColor White
+		$sdns = ($sdn_required.Split(";") | ? {$_ -ne "router"}) -join ';'
+		$num_sdns = @($sdns.Split(";")).length
+		
+		# This isn't pretty but it just queries the cluster for all VNETs and gets the current highest tag in use
+		# For some reason, the name for VNETs and VXLANs can only be a maximum of 8 characters. 
+		# You can include numbers, but for whatever reason, the name can't START with a number.
+		# So that's why the ID is "v$id". The "v" is stripped when applying the tag on the VNET. 
+		# For all intents and purposes, the VNETs tag is the same as its name, and the same as the VXLAN its bound to.
+		$id = ((((Invoke-PVEAPI -route "cluster/sdn/vnets" -params @{
+			Headers = (Get-AccessTicket)
+			Method = "GET"
+		}).data | Select tag).tag | % {[int]$_}) | Measure-Object -Maximum | Select -ExpandProperty Maximum)
+		
+		foreach ($sdn in $sdns.Split(";")) {
+			Write-Host "[+] Creating SDN $sdn for $User" -ForegroundColor Green
+	
+			$id = $id + 1
+			$sdn_id += $id
+			$alias = "$sdn VNET for $User"
+			$vnet = New-VirtualNetwork -VXLAN (New-VXLAN -ID "v$id") -Alias $alias -ID "v$id"
+			$vnets += $vnet
+		}
+		
+		Invoke-PVEAPI -Route "cluster/sdn" -Params @{
+			Headers = (Get-AccessTicket)
+			Method = "PUT"
+		} | Out-Null
+	}
+	
+	foreach ($template in $Templates) {
+		Write-Host "Cloning from template $($template.name); $($template.vmid); $($template.node)..." -BackgroundColor White -ForegroundColor Black
+		
+		[int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket)}).data
+		$node, $last_index = Get-NextNode -LastIndex $last_index -nodes $Nodes
+        $name = "$($Pool)-$($User)-$($template.name.Split('-')[-1])"
+		
+		$acl = @{
+            Professor = $Professor
+            User = $User
+        }
+		
+		$vm = Clone-VM -TemplateID $template.vmid -Node $node -Pool $Pool -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl
+
+		if ($template.SDN) {
+			Set-SDN -SDN $template.SDN -Node $node -VNETs $vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
+		}	
+	}
+}
+
+function Clone-ProxmoxClassVMs {
     Param (
         [Parameter(Mandatory)][string]$Class,
-        [string]$CustomRosterPath = $null,
-        [switch]$SkipTagConfiguration
+        [string]$CustomRosterPath = $null
     )
 
     # STEP 1: Gather a list of students and the professor for the given class
@@ -456,32 +642,11 @@ function Clone-PVEClassVMs {
     $pool_id = $Class -replace ' ', ''
     Create-Pool -id $pool_id
 
-    # STEP 3: Get an array containing each in-use host in the cluster, initialize the index of this array to -1 because the Get-NextNode function will increment it.
-    $nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
-    $last_index = -1
-
-    # STEP 4: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
+    # STEP 3: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
     Sync-Realm -Students $student_list -Professor $professor | Out-Null
 
-    # STEP 5: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
-    foreach ($template in (Get-Templates -Class $Class)) {
-        Write-Host "Cloning from template $($template.name); $($template.vmid); $($template.node)..." -BackgroundColor White -ForegroundColor Black
-
-        foreach ($user in $users) {
-            # Get the next available VM ID and the next node to use
-            [int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket)}).data
-            $node, $last_index = Get-NextNode -LastIndex $last_index -nodes $nodes
-            $name = "$($pool_id)-$($user)-$($template.name.Split('-')[-1])"
-
-            $acl = @{
-                Professor = $Professor
-                User = $user
-            }
-            $vm = Clone-VM -TemplateID $template.vmid -Node $node -Pool $pool_id -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl -SkipTagConfiguration:$SkipTagConfiguration
-            
-            if ($vm.Error) {
-                Write-Warning "Failed to create VM $name; $($vm.Response)"
-            }
-        }
-    }
+    # STEP 4: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
+	foreach ($user in $users) {
+		Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class)
+	}
 }
