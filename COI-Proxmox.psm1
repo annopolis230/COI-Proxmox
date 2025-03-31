@@ -318,7 +318,6 @@ function Get-PVEClassRoster {
 		if ((-not $students) -or (-not $professor)) {
 			throw "Empty student or professor list returned for $($Class). Make sure it is correct."
 		}
-        Write-Host "Roster successfully imported" -ForegroundColor Green
     }
     catch {
         Write-Warning "Unable to import class roster list to find $($Class)."
@@ -627,6 +626,7 @@ function Clone-UserVMs {
 }
 
 function Clone-ProxmoxClassVMs {
+    # Entrypoint; start here for debugging
     Param (
         [Parameter(Mandatory)][string]$Class,
         [string]$CustomRosterPath = $null
@@ -647,6 +647,16 @@ function Clone-ProxmoxClassVMs {
     # STEP 4: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
 	foreach ($user in $users) {
         Write-Host "------- Starting config for $user -------" -ForegroundColor Magenta
-		Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class)
+
+        $does_exist = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"}).data.members | ? {
+            $_.name -match $user
+        }
+        
+        if ($does_exist) {
+            Write-Warning "User $user already exists in $Class. Skipping config..."
+        }
+        else {
+            Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class)
+        }
 	}
 }
