@@ -341,7 +341,7 @@ function Get-Templates {
 	foreach ($template in $template_list) {
 		$config = Invoke-PVEAPI -Route "nodes/$($template.node)/qemu/$($template.vmid)/config" -Params @{Headers = (Get-AccessTicket); Method="GET"}
 		
-		# An example tag is "internal;router;template". This line just removes "template", "<class>" and any leading/trailing semicolons from that string.
+		# An example tag is "internal;router;template;cit-371". This line just removes "template", "<class>" and any leading/trailing semicolons from that string.
 		$sdn_tags = (($config.data.tags).Split(';') | ? {$_ -ne "template" -and $_ -ne ($original_class -replace ' ','-')}) -join ';'
 		if (-not $sdn_tags -eq "") {
 			$template.SDN = $sdn_tags
@@ -568,11 +568,11 @@ function Clone-UserVMs {
 		[Parameter(Mandatory)][string]$User,
 		[Parameter(Mandatory)][string]$Professor,
 		[Parameter(Mandatory)][string]$Pool,
-		[Parameter(Mandatory)][object]$Templates
+		[Parameter(Mandatory)][object]$Templates,
+        [Parameter(Mandatory)][object]$Nodes,
+        [Parameter(Mandatory)][int]$StartingNodeIndex
 	)
 	
-	$last_index = -1
-	$Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
 	$sdn_required = $Templates.SDN -match "router"
 	$vnets = @()
 	
@@ -605,6 +605,7 @@ function Clone-UserVMs {
 		} | Out-Null
 	}
 	
+    $last_index = $StartingNodeIndex
 	foreach ($template in $Templates) {
 		Write-Host "Cloning from template $($template.name); $($template.vmid); $($template.node)..." -BackgroundColor White -ForegroundColor Black
 		
@@ -623,6 +624,7 @@ function Clone-UserVMs {
 			Set-SDN -SDN $template.SDN -Node $node -VNETs $vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
 		}	
 	}
+    return $last_index
 }
 
 function Clone-ProxmoxClassVMs {
@@ -644,6 +646,10 @@ function Clone-ProxmoxClassVMs {
     # STEP 3: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
     Sync-Realm -Students $student_list -Professor $professor | Out-Null
 
+    # STEP 4: Set up the round robin load balancing by initilizating the last_index variable to -1 (the index of the first node to use in the $Nodes array), and gather a list of each node.
+    $last_index = -1
+	$Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
+
     # STEP 4: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
 	foreach ($user in $users) {
         Write-Host "------- Starting config for $user -------" -ForegroundColor Magenta
@@ -656,7 +662,7 @@ function Clone-ProxmoxClassVMs {
             Write-Warning "User $user already exists in $Class. Skipping config..."
         }
         else {
-            Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class)
+            $last_index = Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class) -StartingNodeIndex $last_index -Nodes $Nodes
         }
 	}
 }
