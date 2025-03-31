@@ -569,7 +569,7 @@ function Clone-UserVMs {
 		[Parameter(Mandatory)][string]$Professor,
 		[Parameter(Mandatory)][string]$Pool,
 		[Parameter(Mandatory)][object]$Templates,
-        [Parameter(Mandatory)][object]$Nodes,
+        [Parameter(Mandatory)][array]$Nodes,
         [Parameter(Mandatory)][int]$StartingNodeIndex
 	)
 	
