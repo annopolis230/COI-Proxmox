@@ -122,7 +122,7 @@ function Get-AccessTicket {
             $env:ACCESS_TICKET = "PVEAuthCookie=$($ticket.data.ticket)"
             $env:CSRF_TOKEN = $ticket.data.CSRFPreventionToken
     
-            Write-Host "Session API keys successfully obtained" -ForegroundColor Green
+            Write-Host "API keys loaded into current session. They will expire in 2 hours." -ForegroundColor Black -BackgroundColor Green
         }
         else {
             throw "Could not obtain session ticket and CSRF token. Make sure you have the right permissions on Proxmox."
@@ -579,7 +579,6 @@ function Clone-UserVMs {
 	if ($sdn_required) {
 		Write-Host "Configuring SDN(s) for $User" -ForegroundColor Black -BackgroundColor White
 		$sdns = ($sdn_required.Split(";") | ? {$_ -ne "router"}) -join ';'
-		$num_sdns = @($sdns.Split(";")).length
 		
 		# This isn't pretty but it just queries the cluster for all VNETs and gets the current highest tag in use
 		# For some reason, the name for VNETs and VXLANs can only be a maximum of 8 characters. 
@@ -634,7 +633,7 @@ function Clone-ProxmoxClassVMs {
     )
 
     # STEP 1: Gather a list of students and the professor for the given class
-    $class_roster = Get-ClassRoster -Class $Class -Path $CustomRosterPath
+    $class_roster = Get-PVEClassRoster -Class $Class -Path $CustomRosterPath
     $student_list, $professor = $class_roster[0], $class_roster[1]
     $users = @($student_list) + $professor
 
