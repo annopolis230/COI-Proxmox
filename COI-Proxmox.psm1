@@ -332,6 +332,7 @@ function Get-Templates {
     )
 
     # Given a class code, return all the templates this class uses.
+	$original_class = $Class.Split('-')[0]
     $Class = $Class.Split("-")[0] -replace ' ',''
     $data = Invoke-PVEAPI -Route "pools/Templates" -Params @{Headers = (Get-AccessTicket); Method="GET"} -ErrorBehavior "Stop"
     $template_list = @($data.data.members | ? {$_.name -match $Class} | Select name,vmid,node)
@@ -340,8 +341,8 @@ function Get-Templates {
 	foreach ($template in $template_list) {
 		$config = Invoke-PVEAPI -Route "nodes/$($template.node)/qemu/$($template.vmid)/config" -Params @{Headers = (Get-AccessTicket); Method="GET"}
 		
-		# An example tag is "internal;router;template". This line just removes "template" and any leading/trailing semicolons from that string.
-		$sdn_tags = (($config.data.tags).Split(';') | ? {$_ -ne "template"}) -join ';'
+		# An example tag is "internal;router;template". This line just removes "template", "<class>" and any leading/trailing semicolons from that string.
+		$sdn_tags = (($config.data.tags).Split(';') | ? {$_ -ne "template" -and $_ -ne ($original_class -replace ' ','-')}) -join ';'
 		if (-not $sdn_tags -eq "") {
 			$template.SDN = $sdn_tags
 		}
@@ -593,7 +594,6 @@ function Clone-UserVMs {
 			Write-Host "[+] Creating SDN $sdn for $User" -ForegroundColor Green
 	
 			$id = $id + 1
-			$sdn_id += $id
 			$alias = "$sdn VNET for $User"
 			$vnet = New-VirtualNetwork -VXLAN (New-VXLAN -ID "v$id") -Alias $alias -ID "v$id"
 			$vnets += $vnet
