@@ -528,7 +528,7 @@ function Clone-VM {
         }
     }
 
-    # The Proxmox API is asynchronous, which is overall good. But there's also not any callbacks or event driven ways to check if a VM is actually done cloning before proceeding.
+    # The Proxmox API is asynchronous. There aren't any callbacks or event driven ways to check if a VM is actually done cloning before proceeding.
     # So the best option is to simply poll the API every few seconds to see if its done or not. 
     # If the VMs aren't done before the next step which is to configure the tags, that API call will fail.
 
@@ -584,13 +584,14 @@ function Clone-UserVMs {
 		[Parameter(Mandatory)][string]$Pool,
 		[Parameter(Mandatory)][object]$Templates,
         [Parameter(Mandatory)][array]$Nodes,
-        [Parameter(Mandatory)][int]$StartingNodeIndex
+        [Parameter(Mandatory)][int]$StartingNodeIndex,
+        [switch]$SkipSDN
 	)
 	
 	$sdn_required = $Templates.SDN -match "router"
 	$vnets = @()
 	
-	if ($sdn_required) {
+	if ($sdn_required -and -not $SkipSDN) {
 		Write-Host "Configuring SDN(s) for $User" -ForegroundColor Black -BackgroundColor White
 		$sdns = ($sdn_required.Split(";") | ? {$_ -ne "router"}) -join ';'
 		
@@ -608,7 +609,7 @@ function Clone-UserVMs {
 			Write-Host "[+] Creating SDN $sdn for $User" -ForegroundColor Green
 	
 			$id = $id + 1
-			$alias = "$sdn VNET for $User"
+			$alias = "$($Pool)_$($sdn)_$($User)"
 			$vnet = New-VirtualNetwork -VXLAN (New-VXLAN -ID "v$id") -Alias $alias -ID "v$id"
 			$vnets += $vnet
 		}
@@ -634,7 +635,7 @@ function Clone-UserVMs {
 		
 		$vm = Clone-VM -TemplateID $template.vmid -Node $node -Pool $Pool -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl
 
-		if ($template.SDN) {
+		if ($template.SDN -and -not $SkipSDN) {
 			Set-SDN -SDN $template.SDN -Node $node -VNETs $vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
 		}	
 	}
@@ -661,7 +662,7 @@ function Clone-ProxmoxClassVMs {
     # STEP 3: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
     Sync-Realm -Students $student_list -Professor $professor | Out-Null
 
-    # STEP 4: Set up the round robin load balancing by initilizating the last_index variable to -1 (the index of the first node to use in the $Nodes array), and gather a list of each node.
+    # STEP 4: Set up the round robin load balancing by initializing the last_index variable to -1 (the index of the first node to use in the $Nodes array), and gather a list of each node.
     $last_index = -1
 	$Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
 
