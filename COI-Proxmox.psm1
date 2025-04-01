@@ -22,6 +22,7 @@ $Script:Vars = @{
     Credentials = $null
 }
 
+# Custom exception class to be thrown in case of rare HTTP errors
 class ApiException : System.Exception {
     [int]$StatusCode
     [string]$response
@@ -36,6 +37,7 @@ class ApiException : System.Exception {
     }
 }
 
+# If the current user is the DA user, return their username. Otherwise return da_<user>
 function Get-DAUser {
 	if (($env:USERNAME).StartsWith("da_")) {
 		return $env:USERNAME
@@ -43,6 +45,7 @@ function Get-DAUser {
 	return "da_$env:USERNAME"
 }
 
+# Given a route and a table of parameters, make a request to the Proxmox VE API
 function Invoke-PVEAPI {
     Param (
         [Parameter(Mandatory)][string]$Route,
@@ -100,6 +103,7 @@ function Invoke-PVEAPI {
     }
 }
 
+# Almost every API request requires an access ticket and a CSRF prevention token. If these haven't been cached for the PS session yet, this function will do that.
 function Get-AccessTicket {
     # To prevent re-authenticating within the same PowerShell session, the access ticket and CSRF token are stored in shell variables
     # Note that tickets only last for 2 hours. So it might be possible that someone leaves a terminal open and tries to clone VMs again, only to be met with 401 errors. If that happens just restart the terminal.
@@ -136,6 +140,7 @@ function Get-AccessTicket {
     }
 }
 
+# Create a new resource pool to hold the class's VMs
 function Create-Pool {
     Param (
         [Parameter(Mandatory)][string]$id
@@ -148,23 +153,21 @@ function Create-Pool {
         Write-Warning "Pool $id already exists. Skipping creation..."
     } 
     else {
-        # Try to create the pool, retry one time in case it fails for a reason other than invalid authorization
-        $response = Invoke-PVEAPI -Route "pools" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body=@{poolid=$id}}
-        if ($response.Error -and ($response.StatusCode -ne 401)) {
-            Write-Host "Retrying once..." -ForegroundColor White
-            Invoke-PVEAPI -Route "pools" -Params @{Headers = (Get-AccessTicket); Method="POST"; Body=@{poolid=$id}} -ErrorBehavior Stop
-        }
-        elseif ($response.StatusCode -eq 401) {
-            throw "Unrecoverable HTTP status 401 returned; make sure you have the correct privileges on Proxmox."
-        }
-        else {
-            Write-Host "Created pool with ID $id" -ForegroundColor Green
-        }
+        # Create the pool
+        Invoke-PVEAPI -Route "pools" -Params @{
+            Headers = (Get-AccessTicket)
+            Method="POST"
+            Body=@{
+                poolid=$id
+            }
+        } -ErrorBehavior "Stop"
+
+        Write-Host "Created pool with ID $id" -ForegroundColor Green
     }
 }
 
+# Round robin load balancing. Not a perfect solution: Doesn't take into account VM/cluster performance at all, but it provides a basic level of load balancing
 function Get-NextNode {
-    # Round robin load balancing. Not a perfect solution: Doesn't take into account VM/cluster performance at all, but it provides a basic level of load balancing
     Param (
         [Parameter(Mandatory)][int]$LastIndex,
 		[Parameter(Mandatory)][object]$nodes
@@ -176,6 +179,7 @@ function Get-NextNode {
     return $nodes[$next_index], $next_index
 }
 
+# Creates a new VXLAN and returns its config if successful
 function New-VXLAN {
 	Param (
 		[Parameter(Mandatory)][string]$ID
@@ -207,6 +211,7 @@ function New-VXLAN {
 	return $vxlan_config
 }
 
+# Creates a new VNET and returns its config if successful
 function New-VirtualNetwork {
 	Param (
 		[Parameter(Mandatory)][hashtable]$VXLAN,
@@ -234,6 +239,7 @@ function New-VirtualNetwork {
 	return $vnet_config
 }
 
+# Given a VM and SDN config, this function will figure out which network interface to configure to use the newly created SDN
 function Set-SDN {
 	Param (
 		[Parameter(Mandatory)][string]$SDN,
@@ -243,6 +249,7 @@ function Set-SDN {
 		[switch]$Router
 	)
 	
+    # Unfortunately the MAC address is required when changing a network interface, so this function simply returns the MAC address given an interface on the VM.
 	function Get-MacAddress {
 		Param (
 			[Parameter(Mandatory)][string]$Interface
@@ -265,6 +272,7 @@ function Set-SDN {
 		Write-Warning "FATAL: Could not apply SDN $SDN to $VM_ID; No VNET specified!"
 		return $null
 	}
+    # If there is one VNET given, one SDN is assumed for the class. Therefore, change the bridge on net1 on the router and net0 on every other VM.
 	elseif ($VNETs.length -eq 1) {
 		$vnet = $VNETs
 		if ($Router) {
@@ -274,6 +282,7 @@ function Set-SDN {
 			$Body["net0"] = "virtio=$(Get-MacAddress -Interface "net0"),bridge=$($vnet.vnet),mtu=1"
 		}
 	}
+    # If there's 2 VNETs, both net1 and net2 on the router needs to be configured. net1 goes to the internal SDN, and net2 goes to the dmz.
 	elseif ($VNETs.length -eq 2) {
 		if ($Router) {
 			$internal_bridge = $VNETs | ? {$_.alias -match "internal"}
@@ -297,7 +306,7 @@ function Set-SDN {
 }
 
 # -------- Exported Functions --------
-
+# Returns an array with two members: the first is an array containing the list of students, the second is a string representing the professor
 function Get-PVEClassRoster {
     Param (
         [Parameter(Mandatory)][string]$Class,
@@ -326,12 +335,12 @@ function Get-PVEClassRoster {
 	return $students, $professor
 }
 
+# Given a class code, return all the templates this class uses. This function also determines whether SDNs are required.
 function Get-Templates {
     Param (
         [Parameter(Mandatory)][string]$Class
     )
 
-    # Given a class code, return all the templates this class uses.
 	$original_class = $Class.Split('-')[0]
     $Class = $Class.Split("-")[0] -replace ' ',''
     $data = Invoke-PVEAPI -Route "pools/Templates" -Params @{Headers = (Get-AccessTicket); Method="GET"} -ErrorBehavior "Stop"
@@ -351,6 +360,7 @@ function Get-Templates {
     return $template_list
 }
 
+# Add a TA to the class, give them permissions on every student's VMs. Optionally, clone them the VMs required for the class.
 function Set-ClassTA {
     Param (
         [Parameter(Mandatory)][string]$User,
@@ -398,6 +408,7 @@ function Set-ClassTA {
     }
 }
 
+# Update the access control list to include user and professor permissions on a VM
 function Set-ProxmoxACL {
     Param (
         [Parameter(Mandatory)][string]$Professor,
@@ -427,6 +438,7 @@ function Set-ProxmoxACL {
     }
 }
 
+# Users aren't automatically imported to Proxmox via AD. You must do a realm sync first, which checks against a few AD groups. This happens each time Clone-ProxmoxClassVMs is called to prevent ACL update errors.
 function Sync-Realm {
     Param (
         [Parameter(Mandatory)][object]$Students,
@@ -479,6 +491,7 @@ function Sync-Realm {
     }
 }
 
+# Clone a single VM, configure its tags, and update the ACL. This waits for the VM to finish cloning before proceeding because a lot of subsequent configurations will fail if the VM isn't done.
 function Clone-VM {
     Param (
         [Parameter(Mandatory)][int]$ID,
@@ -563,6 +576,7 @@ function Clone-VM {
     return $vm
 }
 
+# Clone every VM required for the class for a single user. Returns the index of the last node used. This function will load balance each template.
 function Clone-UserVMs {
 	Param (
 		[Parameter(Mandatory)][string]$User,
@@ -627,6 +641,7 @@ function Clone-UserVMs {
     return $last_index
 }
 
+# Do a realm sync and clone VMs for the entire class. Load balances each user's VMs.
 function Clone-ProxmoxClassVMs {
     # Entrypoint; start here for debugging
     Param (
@@ -650,7 +665,7 @@ function Clone-ProxmoxClassVMs {
     $last_index = -1
 	$Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
 
-    # STEP 4: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
+    # STEP 5: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
 	foreach ($user in $users) {
         Write-Host "------- Starting config for $user -------" -ForegroundColor Magenta
 
