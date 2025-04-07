@@ -20,6 +20,7 @@ $AllProtocols = [System.Net.SecurityProtocolType]'Ssl3,Tls,Tls11,Tls12'
 
 $Script:Vars = @{
     Credentials = $null
+    API_Calls = $null
 }
 
 # Custom exception class to be thrown in case of rare HTTP errors
@@ -58,6 +59,7 @@ function Invoke-PVEAPI {
     # Insert the URI and ContentType header into the Params hashtable
     $Params["Uri"] = "https://172.28.116.111:8006/api2/json/$route"
     $Params["ContentType"] = "application/x-www-form-urlencoded"
+    $Vars.API_Calls += 1
 
     try {
         # Send an HTTP request to the Proxmox API
@@ -99,7 +101,7 @@ function Invoke-PVEAPI {
         return $to_return
     }
     else {
-        throw "Unable to proceed without the data required or created from the previous API call."
+        throw "Unable to proceed without the data returned or created from the previous API call."
     }
 }
 
@@ -262,7 +264,7 @@ function Set-SDN {
 		
 		return ($config.$Interface).Split(',')[0].Split('=')[1]
 	}
-	
+
 	$Body = @{
 		node = $Node
 		vmid = $VM_ID
@@ -295,7 +297,7 @@ function Set-SDN {
 			$Body["net0"] = "virtio=$(Get-MacAddress -Interface "net0"),bridge=$($bridge.vnet),mtu=1"
 		}
 	}
-	
+
 	Invoke-PVEAPI -Route "nodes/$Node/qemu/$VM_ID/config" -Params @{
 		Headers = (Get-AccessTicket)
 		Method = "POST"
@@ -491,6 +493,63 @@ function Sync-Realm {
     }
 }
 
+# Remove all VMs and other configuration items such as HA and SDNs for a given class, with the option to skip certain students if necessary
+function Remove-ClassVMs {
+    Param (
+        [Parameter(Mandatory)]$Class,
+        [array]$Skip
+    )
+
+    $pool_id = $Class -replace ' ', ''
+    # Get a list of VMs in the class
+    $vms = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"}).data.members
+    # Get a list of all VXLANs
+    $sdn_zones = (Invoke-PVEAPI -Route "cluster/sdn/zones" -Params @{Headers = (Get-AccessTicket);Method="GET"}).data
+    # Get a list of VNETs
+    $sdn_vnets = (Invoke-PVEAPI -Route "cluster/sdn/vnets" -Params @{Headers = (Get-AccessTicket);Method="GET"}).data
+    # Filter the VM list to not include students in the $Skip array. This ensures those students won't have their VMs or SDNs deleted.
+    $vms_to_delete = $vms | ? {-not ($_.name.Split('-')[-2] -in $Skip)}
+    # Filter the VNET list to only include VNETs used by that class, and not those used by students in the $Skip array
+    $sdns_to_delete = @($sdn_vnets | ? {($_.alias -match $pool_id) -and (-not ($_.alias.Split('_')[-1] -in $Skip))})
+
+    # Delete the VMs
+    foreach ($vm in $vms_to_delete) {
+        Write-Host "Deleting $($vm.name)" -ForegroundColor Gray
+        Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)?purge=1&destroy-unreferenced-disks=1" -Params @{
+            Headers = (Get-AccessTicket)
+            Method = "DELETE"
+        } | Out-Null
+    }
+
+    # Delete the VNETs and VXLANs
+    foreach ($vnet in $sdns_to_delete) {
+        $vxlan = $sdn_zones | ? {$_.zone -eq $vnet.zone}
+
+        # Delete the VNET
+        Write-Host "Deleting VNET $($vnet.vnet)" -ForegroundColor Gray
+        Invoke-PVEAPI -Route "cluster/sdn/vnets/$($vnet.vnet)" -Params @{
+            Headers = (Get-AccessTicket)
+            Method = "DELETE"
+        } | Out-Null
+
+        if ($vxlan) {
+            # Delete the VXLAN
+            Write-Host "Deleting VXLAN $($vxlan.zone)" -ForegroundColor Gray
+            Invoke-PVEAPI -Route "cluster/sdn/zones/$($vxlan.zone)" -Params @{
+                Headers = (Get-AccessTicket)
+                Method = "DELETE"
+            } | Out-Null
+        }
+
+        # Remove the deleted VXLAN from the $sdn_zones list. This is because some classes may have more than one VNET per zone, so the first VNET will delete the zone. We don't want it trying to delete the zone a 2nd time.
+        $sdn_zones = $sdn_zones | ? {$_.zone -ne $vxlan.zone}
+    }
+    Invoke-PVEAPI -Route "cluster/sdn" -Params @{
+        Headers = (Get-AccessTicket)
+        Method = "PUT"
+    } | Out-Null
+}
+
 # Clone a single VM, configure its tags, and update the ACL. This waits for the VM to finish cloning before proceeding because a lot of subsequent configurations will fail if the VM isn't done.
 function Clone-VM {
     Param (
@@ -512,6 +571,7 @@ function Clone-VM {
         return $null
     }
 
+    Write-Host "Cloning $Name from template $($template.vmid)..." -BackgroundColor White -ForegroundColor Black
     # Clone the VM
     Write-Host "[+] Creating $Name with ID $ID on host $Node" -ForegroundColor Green
     $vm = Invoke-PVEAPI -Route "nodes/$TemplateNode/qemu/$TemplateID/clone" -Params @{
@@ -570,6 +630,16 @@ function Clone-VM {
         }
     }
 
+    # Add the VM to HA
+    Invoke-PVEAPI -Route "cluster/ha/resources" -Params @{
+        Headers = (Get-AccessTicket)
+        Method = "POST"
+        Body = @{
+            sid = "vm:$id"
+            state = "stopped"
+        }
+    }
+
     # Configure the access control list
     Set-ProxmoxACL -Professor $ACL.Professor -User $ACL.User -ID $ID
 	
@@ -591,39 +661,37 @@ function Clone-UserVMs {
 	$sdn_required = $Templates.SDN -match "router"
 	$vnets = @()
 	
-	if ($sdn_required -and -not $SkipSDN) {
-		Write-Host "Configuring SDN(s) for $User" -ForegroundColor Black -BackgroundColor White
-		$sdns = ($sdn_required.Split(";") | ? {$_ -ne "router"}) -join ';'
-		
-		# This isn't pretty but it just queries the cluster for all VNETs and gets the current highest tag in use
-		# For some reason, the name for VNETs and VXLANs can only be a maximum of 8 characters. 
-		# You can include numbers, but for whatever reason, the name can't START with a number.
-		# So that's why the ID is "v$id". The "v" is stripped when applying the tag on the VNET. 
-		# For all intents and purposes, the VNETs tag is the same as its name, and the same as the VXLAN its bound to.
-		$id = ((((Invoke-PVEAPI -route "cluster/sdn/vnets" -params @{
-			Headers = (Get-AccessTicket)
-			Method = "GET"
-		}).data | Select tag).tag | % {[int]$_}) | Measure-Object -Maximum | Select -ExpandProperty Maximum)
-		
-		foreach ($sdn in $sdns.Split(";")) {
-			Write-Host "[+] Creating SDN $sdn for $User" -ForegroundColor Green
-	
-			$id = $id + 1
-			$alias = "$($Pool)_$($sdn)_$($User)"
-			$vnet = New-VirtualNetwork -VXLAN (New-VXLAN -ID "v$id") -Alias $alias -ID "v$id"
-			$vnets += $vnet
-		}
-		
-		Invoke-PVEAPI -Route "cluster/sdn" -Params @{
-			Headers = (Get-AccessTicket)
-			Method = "PUT"
-		} | Out-Null
+	if ($sdn_required) {
+        if ($SkipSDN) {
+            Write-Warning "SDN creation being skipped for $User"
+        }
+        else {
+            Write-Host "Configuring SDN(s) for $User" -ForegroundColor Black -BackgroundColor White
+            $sdns = ($sdn_required.Split(";") | ? {$_ -ne "router"}) -join ';'
+            
+            $id = ((((Invoke-PVEAPI -route "cluster/sdn/vnets" -params @{
+                Headers = (Get-AccessTicket)
+                Method = "GET"
+            }).data | Select tag).tag | % {[int]$_}) | Measure-Object -Maximum | Select -ExpandProperty Maximum)
+            
+            foreach ($sdn in $sdns.Split(";")) {
+                Write-Host "[+] Creating SDN $sdn for $User" -ForegroundColor Green
+        
+                $id = $id + 1
+                $alias = "$($Pool)_$($sdn)_$($User)"
+                $vnet = New-VirtualNetwork -VXLAN (New-VXLAN -ID "v$id") -Alias $alias -ID "v$id"
+                $vnets += $vnet
+            }
+            
+            Invoke-PVEAPI -Route "cluster/sdn" -Params @{
+                Headers = (Get-AccessTicket)
+                Method = "PUT"
+            } | Out-Null
+        }
 	}
 	
     $last_index = $StartingNodeIndex
 	foreach ($template in $Templates) {
-		Write-Host "Cloning from template $($template.name); $($template.vmid); $($template.node)..." -BackgroundColor White -ForegroundColor Black
-		
 		[int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket)}).data
 		$node, $last_index = Get-NextNode -LastIndex $last_index -nodes $Nodes
         $name = "$($Pool)-$($User)-$($template.name.Split('-')[-1])"
@@ -635,8 +703,20 @@ function Clone-UserVMs {
 		
 		$vm = Clone-VM -TemplateID $template.vmid -Node $node -Pool $Pool -ID $vm_id -TemplateNode $template.node -Name $name -ACL $acl
 
-		if ($template.SDN -and -not $SkipSDN) {
-			Set-SDN -SDN $template.SDN -Node $node -VNETs $vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
+		if ($vm -and $template.SDN) {
+            # Part 2 of the logic to automatically re-acquire missing VMs. The key here is that Clone-VM will skip individual VMs that already exist, thus I don't actually have to determine which VMs are missing.
+            # But, if the SkipSDN flag was passed to this function, that means the calling function knows that at least 1 VM needs to be reacquired. 
+            # The following logic will do the SDN configuration for that VM if necessary.
+            if ($SkipSDN) {
+                $existing_vnets = @((Invoke-PVEAPI -Route "cluster/sdn/vnets" -Params @{
+                    Headers = (Get-AccessTicket)
+                    Method = "GET"
+                }).data | ? {$_.alias -match "$Pool_?_$User"})
+                Set-SDN -SDN $template.SDN -Node $node -VNET $existing_vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
+            }
+            else {
+                Set-SDN -SDN $template.SDN -Node $node -VNETs $vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
+            }
 		}	
 	}
     return $last_index
@@ -650,6 +730,7 @@ function Clone-ProxmoxClassVMs {
         [string]$CustomRosterPath = $null
     )
 
+    $Vars.API_Calls = 0
     # STEP 1: Gather a list of students and the professor for the given class
     $class_roster = Get-PVEClassRoster -Class $Class -Path $CustomRosterPath
     $student_list, $professor = $class_roster[0], $class_roster[1]
@@ -667,18 +748,27 @@ function Clone-ProxmoxClassVMs {
 	$Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
 
     # STEP 5: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
+    $templates = Get-Templates -Class $Class
+    # This could probably be multithreaded
 	foreach ($user in $users) {
         Write-Host "------- Starting config for $user -------" -ForegroundColor Magenta
 
-        $does_exist = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"}).data.members | ? {
-            $_.name -match $user
-        }
+        # Part 1 of the logic to automatically re-acquire missing VMs. This assumes that if a VM is missing, and the class requires SDNs, those SDNs already exist!
+        # Part 2 of this logic is in the Clone-UserVMs function
+        $does_exist = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"}).data.members | ? {$_.name -match $user}
         
         if ($does_exist) {
-            Write-Warning "User $user already exists in $Class. Skipping config..."
+            if ($does_exist.length -eq $templates.length) {
+                Write-Warning "Full config for $user already exists in $Class. Skipping..."
+            }
+            else {
+                Write-Warning "One or more VMs for $user are missing and will be reacquired..."
+                $last_index = Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates $templates -StartingNodeIndex $last_index -Nodes $Nodes -SkipSDN
+            }
         }
         else {
-            $last_index = Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class) -StartingNodeIndex $last_index -Nodes $Nodes
+            $last_index = Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates $templates -StartingNodeIndex $last_index -Nodes $Nodes
         }
 	}
+    Write-Host "API calls: $($Vars.API_Calls)"
 }
