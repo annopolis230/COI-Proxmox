@@ -402,7 +402,8 @@ function Set-ClassTA {
     Param (
         [Parameter(Mandatory)][string]$User,
         [Parameter(Mandatory)][string]$Class,
-        [switch]$CloneVM
+        [switch]$CloneVM,
+        [string]$CustomRosterPath = $null
     )
 
     # Check if the TA is synced to Proxmox
@@ -420,7 +421,7 @@ function Set-ClassTA {
         }
     }
 
-    $professor = (Get-PVEClassRoster -Class $Class)[1]
+    $professor = (Get-PVEClassRoster -Class $Class -Path $CustomRosterPath)[1]
     $pool_id = $Class -replace ' ', ''
 
     # Get all VMs in the class
@@ -431,7 +432,8 @@ function Set-ClassTA {
     }
 
     if ($CloneVM) {
-        Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class)
+        $Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
+        Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class) -Nodes $Nodes -StartingNodeIndex -1
     }
 }
 
