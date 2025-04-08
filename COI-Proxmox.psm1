@@ -20,8 +20,8 @@ $AllProtocols = [System.Net.SecurityProtocolType]'Ssl3,Tls,Tls11,Tls12'
 
 $Script:Vars = @{
     Credentials = $null
-    API_Calls = $null
 }
+$Script:RuntimeContext = @{}
 
 # Custom exception class to be thrown in case of rare HTTP errors
 class ApiException : System.Exception {
@@ -36,6 +36,38 @@ class ApiException : System.Exception {
     [string] ToString() {
         return "Web request error: Status $($this.StatusCode) - $($this.message)`nResponse: $($this.response)"
     }
+}
+
+# ------- Caching Functions -------
+# Reset the runtime cache. This cache should only persist for the current run, not the entire session. The credentials in $Vars should persist throughout the session.
+function Initialize-RuntimeCache {
+    Write-Host "Initializing runtime cache..."
+
+    $Script:RuntimeContext = @{
+        API_Count = 0
+        Cache_Hits = 0
+        API_Call_List = @()
+        RuntimeCache = @{}
+    }
+}
+
+# Cache whatever is returned from $FetchBlock as $Key in the runtime cache. If it's already in there, it won't try to re-cache it.
+function Get-RuntimeCacheValue {
+    Param (
+        [string]$Key,
+        [string]$Step,
+        [ScriptBlock]$FetchBlock
+    )
+
+    if (-not $Script:RuntimeContext.RuntimeCache.ContainsKey($Key)) {
+        Write-Host "Caching $Key, Step: $Step"
+        $Script:RuntimeContext.RuntimeCache[$Key] = & $FetchBlock
+    }
+    else {
+        $Script:RuntimeContext.Cache_Hits += 1
+    }
+
+    return $Script:RuntimeContext.RuntimeCache[$Key]
 }
 
 # If the current user is the DA user, return their username. Otherwise return da_<user>
@@ -59,7 +91,8 @@ function Invoke-PVEAPI {
     # Insert the URI and ContentType header into the Params hashtable
     $Params["Uri"] = "https://172.28.116.111:8006/api2/json/$route"
     $Params["ContentType"] = "application/x-www-form-urlencoded"
-    $Vars.API_Calls += 1
+    $Script:RuntimeContext.API_Count += 1
+    #$Script:RuntimeContext.API_Call_List += "$($Params.Method) $($Params.Uri)"
 
     try {
         # Send an HTTP request to the Proxmox API
@@ -187,7 +220,9 @@ function New-VXLAN {
 		[Parameter(Mandatory)][string]$ID
 	)
 
-	$cluster = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data)
+    $cluster = (Get-RuntimeCacheValue -Key "Available_Nodes" -FetchBlock {
+        @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data)
+    } -Step "New-VXLAN")
 	$nodes = @($cluster | Select -ExpandProperty name) -join ","
 	$peers = @($cluster | Select -ExpandProperty ring0_addr) -join ","
 	$vxlan_config = @{
@@ -371,12 +406,7 @@ function Set-ClassTA {
     )
 
     # Check if the TA is synced to Proxmox
-    $config = Invoke-PVEAPI -Route "access/users/$User@NKU" -Silent -Params @{
-        Headers = (Get-AccessTicket)
-        Body = @{
-            userid = "$User@NKU"
-        }
-    }
+    $config = Invoke-PVEAPI -Route "access/users/$User@NKU" -Silent -Params @{Headers = (Get-AccessTicket); Method = "GET"}
 
     if ($config.Response -match "no such user") {
         Write-Host "TA $user not synced with Proxmox realm. Syncing now..." -ForegroundColor Yellow
@@ -394,12 +424,7 @@ function Set-ClassTA {
     $pool_id = $Class -replace ' ', ''
 
     # Get all VMs in the class
-    $pool_members = (Invoke-PVEAPI -Route "pools" -Params @{
-        Headers = (Get-AccessTicket)
-        Body = @{
-            poolid = $pool_id
-        }
-    } -ErrorBehavior "Stop").data.members | Select -ExpandProperty vmid
+    $pool_members = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data.members | Select -ExpandProperty vmid
 
     foreach ($id in $pool_members) {
         Set-ProxmoxACL -Professor $professor -User $User -ID $id
@@ -451,6 +476,8 @@ function Sync-Realm {
         $Vars.Credentials = (Get-Credential -Credential (Get-DAUser))
     }
 
+    $update = $false
+
     $students_group = Get-ADGroupMember -Identity "Proxmox_Students" -Credential $Vars.Credentials | Select -ExpandProperty Name
     $faculty_group = Get-ADGroupMember -Identity "Proxmox_Faculty" -Credential $Vars.Credentials | Select -ExpandProperty Name
 	$admin_group = Get-ADGroupMember -Identity "Proxmox_Admins" -Credential $Vars.Credentials | Select -ExpandProperty Name
@@ -462,6 +489,7 @@ function Sync-Realm {
     
             # If this fails, it will cause every later ACL update to fail because the professor gets added to every VM. So no error handling here.
             Add-ADGroupMember -Identity "Proxmox_Faculty" -Members $Professor -ErrorAction Stop -Credential $Vars.Credentials 
+            $update = $true
         }
     }
 
@@ -470,6 +498,7 @@ function Sync-Realm {
         if ((-not ($user -in $students_group)) -and (-not ($user -in $admin_group))) {
             try {
                 Add-ADGroupMember -Identity "Proxmox_Students" -Members $user -ErrorAction Stop -Credential $Vars.Credentials
+                $update = $true
             }
             catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException]{
                 Write-Host "Failed to add $user to Proxmox_Students AD group. They do not exist in AD. This will likely cause a failure when updating their VM permissions."
@@ -480,15 +509,17 @@ function Sync-Realm {
     # Once the relevant AD groups are updated we can proceed with the realm sync against the LDAP query:
     # (|(memberOf=CN=Proxmox_Admins,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu)(memberOf=CN=Proxmox_Faculty,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu)(memberOf=CN=Proxmox_Students,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu))
 
-    Write-Host "Syncing realm..." -ForegroundColor Green
-    Invoke-PVEAPI -Route "access/domains/NKU/sync" -ErrorBehavior "Stop" -Params @{
-        Headers = (Get-AccessTicket)
-        Method = "POST"
-        Body = @{
-            "realm" = "NKU"
-            "enable-new" = 1
-            "scope" = "both"
-            "remove-vanished" = "acl;properties;entry"
+    if ($update) {
+        Write-Host "Syncing realm..." -ForegroundColor Green
+        Invoke-PVEAPI -Route "access/domains/NKU/sync" -ErrorBehavior "Stop" -Params @{
+            Headers = (Get-AccessTicket)
+            Method = "POST"
+            Body = @{
+                "realm" = "NKU"
+                "enable-new" = 1
+                "scope" = "both"
+                "remove-vanished" = "acl;properties;entry"
+            }
         }
     }
 }
@@ -515,6 +546,7 @@ function Remove-ClassVMs {
     # Delete the VMs
     foreach ($vm in $vms_to_delete) {
         Write-Host "Deleting $($vm.name)" -ForegroundColor Gray
+        Start-Sleep -Milliseconds 100
         Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)?purge=1&destroy-unreferenced-disks=1" -Params @{
             Headers = (Get-AccessTicket)
             Method = "DELETE"
@@ -563,11 +595,16 @@ function Clone-VM {
     )
 
     # Check if the VM already exists before cloning it
-    $vms = (Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{Headers = (Get-AccessTicket)}).data
-    $does_exist = [bool]($vms | ? {$_.name -eq $name})
+    $vms = (Get-RuntimeCacheValue -Key "Initial_VM_State" -FetchBlock {
+        Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{
+            Headers = (Get-AccessTicket)
+            Method = "GET"
+        }
+    } -Step "Clone-VM with name $Name").data
+    $does_exist = [bool]($vms | ? {$_.name -eq $Name})
 
     if ($does_exist) {
-        Write-Warning "VM $name already exists. Skipping..."
+        Write-Warning "VM $Name already exists. Skipping..."
         return $null
     }
 
@@ -669,7 +706,7 @@ function Clone-UserVMs {
             Write-Host "Configuring SDN(s) for $User" -ForegroundColor Black -BackgroundColor White
             $sdns = ($sdn_required.Split(";") | ? {$_ -ne "router"}) -join ';'
             
-            $id = ((((Invoke-PVEAPI -route "cluster/sdn/vnets" -params @{
+            $id = ((((Invoke-PVEAPI -route "cluster/sdn/vnets" -Params @{
                 Headers = (Get-AccessTicket)
                 Method = "GET"
             }).data | Select tag).tag | % {[int]$_}) | Measure-Object -Maximum | Select -ExpandProperty Maximum)
@@ -692,7 +729,7 @@ function Clone-UserVMs {
 	
     $last_index = $StartingNodeIndex
 	foreach ($template in $Templates) {
-		[int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket)}).data
+		[int]$vm_id = (Invoke-PVEAPI -Route "cluster/nextid" -Params @{Headers = (Get-AccessTicket); Method = "GET"}).data
 		$node, $last_index = Get-NextNode -LastIndex $last_index -nodes $Nodes
         $name = "$($Pool)-$($User)-$($template.name.Split('-')[-1])"
 		
@@ -730,7 +767,8 @@ function Clone-ProxmoxClassVMs {
         [string]$CustomRosterPath = $null
     )
 
-    $Vars.API_Calls = 0
+    Initialize-RuntimeCache
+
     # STEP 1: Gather a list of students and the professor for the given class
     $class_roster = Get-PVEClassRoster -Class $Class -Path $CustomRosterPath
     $student_list, $professor = $class_roster[0], $class_roster[1]
@@ -745,7 +783,9 @@ function Clone-ProxmoxClassVMs {
 
     # STEP 4: Set up the round robin load balancing by initializing the last_index variable to -1 (the index of the first node to use in the $Nodes array), and gather a list of each node.
     $last_index = -1
-	$Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
+    $Nodes = (Get-RuntimeCacheValue -Key "Available_Nodes" -FetchBlock {
+        @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data)
+    } -Step "Available nodes in Clone-ProxmoxClassVMs") | Select -ExpandProperty name
 
     # STEP 5: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
     $templates = Get-Templates -Class $Class
@@ -755,8 +795,13 @@ function Clone-ProxmoxClassVMs {
 
         # Part 1 of the logic to automatically re-acquire missing VMs. This assumes that if a VM is missing, and the class requires SDNs, those SDNs already exist!
         # Part 2 of this logic is in the Clone-UserVMs function
-        $does_exist = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"}).data.members | ? {$_.name -match $user}
-        
+        $does_exist = (Get-RuntimeCacheValue -Key "Initial_VM_State" -FetchBlock {
+            Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{
+                Headers = (Get-AccessTicket)
+                Method = "GET"
+            } -ErrorBehavior "Stop"
+        } -Step "VM Discovery in Clone-ProxmoxClassVMs").data | ? {$_.name -match $user -and $_.pool -eq $pool_id}
+
         if ($does_exist) {
             if ($does_exist.length -eq $templates.length) {
                 Write-Warning "Full config for $user already exists in $Class. Skipping..."
@@ -770,5 +815,8 @@ function Clone-ProxmoxClassVMs {
             $last_index = Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates $templates -StartingNodeIndex $last_index -Nodes $Nodes
         }
 	}
-    Write-Host "API calls: $($Vars.API_Calls)"
+
+    Write-Host "-------------------`nAPI calls: $($Script:RuntimeContext.API_Count)" -ForegroundColor White
+    Write-Host "Cache hits: $($Script:RuntimeContext.Cache_Hits)" -ForegroundColor White
+    #$Script:RuntimeContext.API_Call_List | % {$_}
 }
