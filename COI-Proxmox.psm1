@@ -81,6 +81,7 @@ function Generate-CacheReport {
     Write-Host "Cache Hits: $($Script:RuntimeContext.Cache_Hits)" -ForegroundColor White
 }
 
+# ------- Utilities -------
 # If the current user is the DA user, return their username. Otherwise return da_<user>
 function Get-DAUser {
 	if (($env:USERNAME).StartsWith("da_")) {
@@ -186,6 +187,20 @@ function Get-AccessTicket {
     }
 }
 
+# Round robin load balancing. Not a perfect solution: Doesn't take into account VM/cluster performance at all, but it provides a basic level of load balancing
+function Get-NextNode {
+    Param (
+        [Parameter(Mandatory)][int]$LastIndex,
+		[Parameter(Mandatory)][object]$nodes
+    )
+
+    $next_index = ($LastIndex + 1) % $nodes.length
+
+    # Return the next node to use and the index of that node in the $nodes array. This will loop around the array, going back to 0 after the last has been used.
+    return $nodes[$next_index], $next_index
+}
+
+# ------- Non-Exported Proxmox Functions -------
 # Create a new resource pool to hold the class's VMs
 function Create-Pool {
     Param (
@@ -210,19 +225,6 @@ function Create-Pool {
 
         Write-Host "Created pool with ID $id" -ForegroundColor Green
     }
-}
-
-# Round robin load balancing. Not a perfect solution: Doesn't take into account VM/cluster performance at all, but it provides a basic level of load balancing
-function Get-NextNode {
-    Param (
-        [Parameter(Mandatory)][int]$LastIndex,
-		[Parameter(Mandatory)][object]$nodes
-    )
-
-    $next_index = ($LastIndex + 1) % $nodes.length
-
-    # Return the next node to use and the index of that node in the $nodes array. This will loop around the array, going back to 0 after the last has been used.
-    return $nodes[$next_index], $next_index
 }
 
 # Creates a new VXLAN and returns its config if successful
@@ -547,6 +549,7 @@ function Sync-Realm {
 }
 
 # Remove all VMs and other configuration items such as HA and SDNs for a given class, with the option to skip certain students if necessary
+# This function doesn't use caching because each API is called exactly once, so caching wouldn't make a difference
 function Remove-ClassVMs {
     Param (
         [Parameter(Mandatory)]$Class,
@@ -842,5 +845,4 @@ function Clone-ProxmoxClassVMs {
 	}
 
     Generate-CacheReport
-    #$Script:RuntimeContext.API_Call_List | % {$_}
 }
