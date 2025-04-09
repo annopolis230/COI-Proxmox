@@ -44,7 +44,9 @@ function Initialize-RuntimeCache {
     Write-Host "Initializing runtime cache..."
 
     $Script:RuntimeContext = @{
+        Start_Time = Get-Date
         API_Count = 0
+        API_Polls = 0
         Cache_Hits = 0
         API_Call_List = @()
         RuntimeCache = @{}
@@ -68,6 +70,15 @@ function Get-RuntimeCacheValue {
     }
 
     return $Script:RuntimeContext.RuntimeCache[$Key]
+}
+
+function Generate-CacheReport {
+    $time = (Get-Date) - ($Script:RuntimeContext.Start_Time)
+    Write-Host "-----------------------------------------------"
+    Write-Host "Total Time: $($time.Minutes) minutes and $($time.Seconds) seconds" -ForegroundColor White
+    Write-Host "API Calls: $($Script:RuntimeContext.API_Count)" -ForegroundColor White
+    Write-Host "API Polls: $($Script:RuntimeContext.API_Polls)" -ForegroundColor White
+    Write-Host "Cache Hits: $($Script:RuntimeContext.Cache_Hits)" -ForegroundColor White
 }
 
 # If the current user is the DA user, return their username. Otherwise return da_<user>
@@ -402,10 +413,11 @@ function Set-ClassTA {
     Param (
         [Parameter(Mandatory)][string]$User,
         [Parameter(Mandatory)][string]$Class,
-        [switch]$CloneVM,
-        [string]$CustomRosterPath = $null
+        [Parameter(Mandatory)][string]$Professor,
+        [switch]$CloneVM
     )
 
+    Initialize-RuntimeCache
     # Check if the TA is synced to Proxmox
     $config = Invoke-PVEAPI -Route "access/users/$User@NKU" -Silent -Params @{Headers = (Get-AccessTicket); Method = "GET"}
 
@@ -421,20 +433,28 @@ function Set-ClassTA {
         }
     }
 
-    $professor = (Get-PVEClassRoster -Class $Class -Path $CustomRosterPath)[1]
     $pool_id = $Class -replace ' ', ''
 
     # Get all VMs in the class
-    $pool_members = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data.members | Select -ExpandProperty vmid
+    $pool_members = (Get-RuntimeCacheValue -Key "Initial_VM_State" -FetchBlock {
+        Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{
+            Headers = (Get-AccessTicket)
+            Method = "GET"
+        } -ErrorBehavior "Stop"
+    } -Step "VM Discovery in Set-ClassTA").data | ? {$_.pool -eq $pool_id} | Select -ExpandProperty vmid
 
     foreach ($id in $pool_members) {
-        Set-ProxmoxACL -Professor $professor -User $User -ID $id
+        Set-ProxmoxACL -Professor $Professor -User $User -ID $id
     }
 
     if ($CloneVM) {
-        $Nodes = @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data | Select -ExpandProperty name)
-        Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates (Get-Templates -Class $Class) -Nodes $Nodes -StartingNodeIndex -1
+        $Nodes = (Get-RuntimeCacheValue -Key "Available_Nodes" -FetchBlock {
+            @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data)
+        } -Step "Available nodes in Set-ClassTA") | Select -ExpandProperty name
+
+        Clone-UserVMs -User $User -Professor $Professor -Pool $pool_id -Templates (Get-Templates -Class $Class) -Nodes $Nodes -StartingNodeIndex -1 | Out-Null
     }
+    Generate-CacheReport
 }
 
 # Update the access control list to include user and professor permissions on a VM
@@ -548,7 +568,8 @@ function Remove-ClassVMs {
     # Delete the VMs
     foreach ($vm in $vms_to_delete) {
         Write-Host "Deleting $($vm.name)" -ForegroundColor Gray
-        Start-Sleep -Milliseconds 100
+        # Waiting a couple seconds before the next delete operation ensures ceph has enough time to process the last. This prevents delete fails although they're still possible
+        Start-Sleep -Seconds 2
         Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)?purge=1&destroy-unreferenced-disks=1" -Params @{
             Headers = (Get-AccessTicket)
             Method = "DELETE"
@@ -647,6 +668,8 @@ function Clone-VM {
             Method = "GET"
             Headers = (Get-AccessTicket)
         } -Silent
+
+        $Script:RuntimeContext.API_Polls += 1
     
         if ($status.data.status -eq "stopped") {
             Write-Host "    [+] Done" -ForegroundColor Green
@@ -818,7 +841,6 @@ function Clone-ProxmoxClassVMs {
         }
 	}
 
-    Write-Host "-------------------`nAPI calls: $($Script:RuntimeContext.API_Count)" -ForegroundColor White
-    Write-Host "Cache hits: $($Script:RuntimeContext.Cache_Hits)" -ForegroundColor White
+    Generate-CacheReport
     #$Script:RuntimeContext.API_Call_List | % {$_}
 }
