@@ -1,8 +1,6 @@
-# Keep this until COI stops using self signed certificates. There's 3 solutions here:
-# 1. Manually import the certificates to make Windows trust them (not happening)
-# 2. Call the curl binary directly instead of Invoke-WebRequest to use the -k certificate check skip option (It'd be better to keep everything in PowerShell)
-# 3. The best option: Create a custom C# class to ignore certificate errors and import this policy which effectively makes Windows trust all SSL certificates.
-# Obviously this isn't very secure, but these settings only persist for the current session so it'll be fine until COI stops using self-signed certificates.
+#####################
+# This essentially makes the current PowerShell session trust all certificates. There's no skip certificate check option in PowerShell 5.
+# KEEP THIS UNTIL COI STOPS USING SELF-SIGNED CERTIFICATES
 add-type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
@@ -17,6 +15,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 $AllProtocols = [System.Net.SecurityProtocolType]'Ssl3,Tls,Tls11,Tls12'
 [System.Net.ServicePointManager]::SecurityProtocol = $AllProtocols
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+# Remove from HERE up 
+#####################
 
 $Script:Vars = @{
     Credentials = $null
@@ -40,6 +40,7 @@ class ApiException : System.Exception {
 
 # ------- Caching Functions -------
 # Reset the runtime cache. This cache should only persist for the current run, not the entire session. The credentials in $Vars should persist throughout the session.
+# Note: This function MUST be called at the beginning of an exported function if at some point during that function's execution it uses something from the cache. Even if that function doesn't directly use it (i.e. it calls another function that does)
 function Initialize-RuntimeCache {
     Write-Host "Initializing runtime cache..."
 
@@ -101,6 +102,8 @@ function Invoke-PVEAPI {
 
     $err = $false
     # Insert the URI and ContentType header into the Params hashtable
+    # CHANGE THIS IF THE IP ADDRESS OR DNS NAME CHANGES (Keep the /api2/json/$route)
+    # for example: $Params["Uri"] = "https://$newip:8006/api2/json/$route"
     $Params["Uri"] = "https://172.28.116.111:8006/api2/json/$route"
     $Params["ContentType"] = "application/x-www-form-urlencoded"
     $Script:RuntimeContext.API_Count += 1
@@ -290,6 +293,7 @@ function New-VirtualNetwork {
 }
 
 # Given a VM and SDN config, this function will figure out which network interface to configure to use the newly created SDN
+# CURRENTLY only supports a max of 2 SDNs per student. If more are required, you could add another elseif or just do it the right way and programatically determine how many are needed
 function Set-SDN {
 	Param (
 		[Parameter(Mandatory)][string]$SDN,
@@ -411,6 +415,9 @@ function Get-Templates {
 }
 
 # Add a TA to the class, give them permissions on every student's VMs. Optionally, clone them the VMs required for the class.
+# Note: This function sucks. There's really no reason for this function to need the professor, but it's only required because the other functions need to know.
+# You might be saying "just import the roster and get the professor from there", but that won't work because custom rosters exist. 
+# Honestly I don't really care enough to "fix" it because it works just fine. Just not the optimal solution.
 function Set-ClassTA {
     Param (
         [Parameter(Mandatory)][string]$User,
@@ -533,8 +540,11 @@ function Sync-Realm {
     # Once the relevant AD groups are updated we can proceed with the realm sync against the LDAP query:
     # (|(memberOf=CN=Proxmox_Admins,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu)(memberOf=CN=Proxmox_Faculty,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu)(memberOf=CN=Proxmox_Students,OU=Proxmox,OU=Security,OU=Groups,OU=HH,OU=NKU,DC=hh,DC=nku,DC=edu))
 
+    # We only actually do the realm sync if it found users that weren't already in the relevant AD groups. If they're in those groups before syncing, it assumes a previous sync already imported them.
+    # This is because adding someone to an AD group takes time, so the script will wait 10 seconds before making an API request to go through with the sync.
     if ($update) {
-        Write-Host "Syncing realm..." -ForegroundColor Green
+        Write-Host "Realm sync required. Syncing now..." -ForegroundColor Green
+        Start-Sleep -Seconds 10
         Invoke-PVEAPI -Route "access/domains/NKU/sync" -ErrorBehavior "Stop" -Params @{
             Headers = (Get-AccessTicket)
             Method = "POST"
@@ -549,6 +559,7 @@ function Sync-Realm {
 }
 
 # Remove all VMs and other configuration items such as HA and SDNs for a given class, with the option to skip certain students if necessary
+# Note: I was running into a lot of issues on the Proxmox side when using destroy-unreferenced-disks=1. So for now its off. 
 # This function doesn't use caching because each API is called exactly once, so caching wouldn't make a difference
 function Remove-ClassVMs {
     Param (
@@ -573,7 +584,8 @@ function Remove-ClassVMs {
         Write-Host "Deleting $($vm.name)" -ForegroundColor Gray
         # Waiting a couple seconds before the next delete operation ensures ceph has enough time to process the last. This prevents delete fails although they're still possible
         Start-Sleep -Seconds 2
-        Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)?purge=1&destroy-unreferenced-disks=1" -Params @{
+        # -Route "nodes/$($vm.node)/qemu/$($vm.vmid)?purge=1&destroy-unreferenced-disks=1"
+        Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)?purge=1" -Params @{
             Headers = (Get-AccessTicket)
             Method = "DELETE"
         } | Out-Null
@@ -600,6 +612,7 @@ function Remove-ClassVMs {
         }
 
         # Remove the deleted VXLAN from the $sdn_zones list. This is because some classes may have more than one VNET per zone, so the first VNET will delete the zone. We don't want it trying to delete the zone a 2nd time.
+        # didn't actually test this. If you noticed issues relating to SDNs not being deleted for a class that requires more than 1 per student, this is probably the culprit.
         $sdn_zones = $sdn_zones | ? {$_.zone -ne $vxlan.zone}
     }
     Invoke-PVEAPI -Route "cluster/sdn" -Params @{
@@ -648,6 +661,7 @@ function Clone-VM {
             target = $Node
             name = $name
             full = 1
+            storage = "COIVMSTORAGE"
         }
     }
 
