@@ -582,7 +582,8 @@ function Remove-ClassVMs {
     $sdns_to_delete = @($sdn_vnets | ? {($_.alias -match $pool_id) -and (-not ($_.alias.Split('_')[-1] -in $Skip))})
 
     if ($SkipUnreferencedDisks) {
-        $Params = "?purge=1" 
+        $Params = "?purge=1"
+        Write-Warning "Unreferenced disks not being destroyed from all enabled storages. This could result in orphaned images!" 
     }
     else {
         $Params = "?purge=1&destroy-unreferenced-disks=1"
