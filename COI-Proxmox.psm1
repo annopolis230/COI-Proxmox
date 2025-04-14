@@ -559,12 +559,14 @@ function Sync-Realm {
 }
 
 # Remove all VMs and other configuration items such as HA and SDNs for a given class, with the option to skip certain students if necessary
-# Note: I was running into a lot of issues on the Proxmox side when using destroy-unreferenced-disks=1. So for now its off. 
-# This function doesn't use caching because each API is called exactly once, so caching wouldn't make a difference
+# I didn't include fallback logic to avoid unecessary API overhead and keep the deletion process fast and predictable.
+# If deletion fails, that's a signal of underlying storage issues that should fixed at the infrastructure level.
+# But you can get around those errors by using the -SkipUnreferencedDisks option.
 function Remove-ClassVMs {
     Param (
         [Parameter(Mandatory)]$Class,
-        [array]$Skip
+        [array]$Skip,
+        [switch]$SkipUnreferencedDisks
     )
 
     $pool_id = $Class -replace ' ', ''
@@ -579,13 +581,18 @@ function Remove-ClassVMs {
     # Filter the VNET list to only include VNETs used by that class, and not those used by students in the $Skip array
     $sdns_to_delete = @($sdn_vnets | ? {($_.alias -match $pool_id) -and (-not ($_.alias.Split('_')[-1] -in $Skip))})
 
+    if ($SkipUnreferencedDisks) {
+        $Params = "?purge=1" 
+    }
+    else {
+        $Params = "?purge=1&destroy-unreferenced-disks=1"
+    }
     # Delete the VMs
     foreach ($vm in $vms_to_delete) {
         Write-Host "Deleting $($vm.name)" -ForegroundColor Gray
         # Waiting a couple seconds before the next delete operation ensures ceph has enough time to process the last. This prevents delete fails although they're still possible
-        Start-Sleep -Seconds 2
-        # -Route "nodes/$($vm.node)/qemu/$($vm.vmid)?purge=1&destroy-unreferenced-disks=1"
-        Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)?purge=1" -Params @{
+
+        Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)$Params" -Params @{
             Headers = (Get-AccessTicket)
             Method = "DELETE"
         } | Out-Null
@@ -831,7 +838,7 @@ function Clone-ProxmoxClassVMs {
 
     # STEP 5: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
     $templates = Get-Templates -Class $Class
-    # This could probably be multithreaded
+    # This could probably be multithreaded, but then again probably not. Don't be a hero
 	foreach ($user in $users) {
         Write-Host "------- Starting config for $user -------" -ForegroundColor Magenta
 
@@ -857,6 +864,5 @@ function Clone-ProxmoxClassVMs {
             $last_index = Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates $templates -StartingNodeIndex $last_index -Nodes $Nodes
         }
 	}
-
     Generate-CacheReport
 }
