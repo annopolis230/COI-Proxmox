@@ -39,13 +39,14 @@ class ApiException : System.Exception {
 }
 
 # ------- Caching Functions -------
-# Reset the runtime cache. This cache should only persist for the current run, not the entire session. The credentials in $Vars should persist throughout the session.
+# Reset the runtime cache. This cache should only persist for the current run, not the entire session (VERY important distinction!). The credentials in $Vars should persist throughout the session.
 # Note: This function MUST be called at the beginning of an exported function if at some point during that function's execution it uses something from the cache. Even if that function doesn't directly use it (i.e. it calls another function that does)
 function Initialize-RuntimeCache {
     Write-Host "Initializing runtime cache..."
 
     $Script:RuntimeContext = @{
         Start_Time = Get-Date
+        VMs_Cloned = 0
         API_Count = 0
         API_Polls = 0
         Cache_Hits = 0
@@ -75,8 +76,10 @@ function Get-RuntimeCacheValue {
 
 function Generate-CacheReport {
     $time = (Get-Date) - ($Script:RuntimeContext.Start_Time)
+
     Write-Host "-----------------------------------------------"
     Write-Host "Total Time: $($time.Minutes) minutes and $($time.Seconds) seconds" -ForegroundColor White
+    Write-Host "VMs Cloned: $($Script:RuntimeContext.VMs_Cloned)" -ForegroundColor White
     Write-Host "API Calls: $($Script:RuntimeContext.API_Count)" -ForegroundColor White
     Write-Host "API Polls: $($Script:RuntimeContext.API_Polls)" -ForegroundColor White
     Write-Host "Cache Hits: $($Script:RuntimeContext.Cache_Hits)" -ForegroundColor White
@@ -207,7 +210,8 @@ function Get-NextNode {
 # Create a new resource pool to hold the class's VMs
 function Create-Pool {
     Param (
-        [Parameter(Mandatory)][string]$id
+        [Parameter(Mandatory)][string]$id,
+        [Parameter(Mandatory)][string]$Professor
     )
 
     $pools = Invoke-PVEAPI -Route "pools" -Params @{Headers = (Get-AccessTicket); Method="GET"} -ErrorBehavior "Stop"
@@ -224,9 +228,21 @@ function Create-Pool {
             Body=@{
                 poolid=$id
             }
-        } -ErrorBehavior "Stop"
+        } -ErrorBehavior "Stop" | Out-Null
 
         Write-Host "Created pool with ID $id" -ForegroundColor Green
+        Start-Sleep -Seconds 2
+
+        Invoke-PVEAPI -Route "access/acl" -Params @{
+            Headers = (get-accessticket)
+            Method = "PUT"
+            Body = @{
+                path = "/pool/$id"
+                roles = "Faculty-Students"
+                users = "$Professor@NKU"
+                propagate = 1
+            }
+        } | Out-Null
     }
 }
 
@@ -327,6 +343,7 @@ function Set-SDN {
 		return $null
 	}
     # If there is one VNET given, one SDN is assumed for the class. Therefore, change the bridge on net1 on the router and net0 on every other VM.
+    # This has been tested and works as intended
 	elseif ($VNETs.length -eq 1) {
 		$vnet = $VNETs
 		if ($Router) {
@@ -337,6 +354,7 @@ function Set-SDN {
 		}
 	}
     # If there's 2 VNETs, both net1 and net2 on the router needs to be configured. net1 goes to the internal SDN, and net2 goes to the dmz.
+    # I never got a chance to test if this actually works for a class that needs more than 1 SDN, so if issues are arising, it's probably from here
 	elseif ($VNETs.length -eq 2) {
 		if ($Router) {
 			$internal_bridge = $VNETs | ? {$_.alias -match "internal"}
@@ -444,6 +462,20 @@ function Set-ClassTA {
 
     $pool_id = $Class -replace ' ', ''
 
+    # Set permissions on the resource pool
+    # Yes, the 'propagate' parameter is used here, but this doesn't allow users with permissions on the POOL to do anything other than simply view the VMs inside the pool.
+    # This is because Proxmox's ACL is path based, and when it checks for inheritance, it uses that path. The path for pool and VM permissions are different. 
+    Invoke-PVEAPI -Route "access/acl" -Params @{
+        Headers = (get-accessticket)
+        Method = "PUT"
+        Body = @{
+            path = "/pool/$pool_id"
+            roles = "Faculty-Students"
+            users = "$User@NKU"
+            propagate = 1
+        }
+    } | Out-Null
+
     # Get all VMs in the class
     $pool_members = (Get-RuntimeCacheValue -Key "Initial_VM_State" -FetchBlock {
         Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{
@@ -452,9 +484,12 @@ function Set-ClassTA {
         } -ErrorBehavior "Stop"
     } -Step "VM Discovery in Set-ClassTA").data | ? {$_.pool -eq $pool_id} | Select -ExpandProperty vmid
 
+    # Explicitly set permissions on each VM
     foreach ($id in $pool_members) {
         Set-ProxmoxACL -Professor $Professor -User $User -ID $id
     }
+
+    Write-Host "Permissions on $pool_id set for $User" -ForegroundColor Green
 
     if ($CloneVM) {
         $Nodes = (Get-RuntimeCacheValue -Key "Available_Nodes" -FetchBlock {
@@ -590,10 +625,46 @@ function Remove-ClassVMs {
     }
     # Delete the VMs
     foreach ($vm in $vms_to_delete) {
-        Write-Host "Deleting $($vm.name)" -ForegroundColor Gray
-        # Waiting a couple seconds before the next delete operation ensures ceph has enough time to process the last. This prevents delete fails although they're still possible
+        if ($vm.status -eq "running") {
+            Write-Warning "VM $($vm.name) is running. Stopping now..."
 
+            Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)/status/stop" -Params @{
+                Headers = (Get-AccessTicket)
+                Method = "POST"
+            } | Out-Null
+
+            Start-Sleep -Seconds 3
+            $complete = $false
+
+            do {
+                $status = Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)/status/current" -Params @{
+                    Headers = (Get-AccessTicket)
+                    Method = "GET"
+                }
+
+                if ($status.data.status -eq "stopped") {
+                    $complete = $true
+                }
+                else {
+                    Start-Sleep -Seconds 3
+                }
+            } while (-not $complete)
+        }
+
+        Write-Host "[-] Deleting $($vm.name)" -ForegroundColor DarkYellow
         Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)$Params" -Params @{
+            Headers = (Get-AccessTicket)
+            Method = "DELETE"
+        } | Out-Null
+
+        # Waiting a couple seconds before the next delete operation ensures ceph has enough time to process the last. This prevents delete fails although they're still possible
+        Start-Sleep -Seconds 2
+    }
+
+    if (-not $Skip) {
+        # Delete the pool if all members were deleted
+        Write-Host "[-] Deleting pool $pool_id" -ForegroundColor DarkYellow
+        Invoke-PVEAPI -Route "pools/?poolid=$pool_id" -Params @{
             Headers = (Get-AccessTicket)
             Method = "DELETE"
         } | Out-Null
@@ -604,7 +675,7 @@ function Remove-ClassVMs {
         $vxlan = $sdn_zones | ? {$_.zone -eq $vnet.zone}
 
         # Delete the VNET
-        Write-Host "Deleting VNET $($vnet.vnet)" -ForegroundColor Gray
+        Write-Host "[-] Deleting VNET $($vnet.vnet)" -ForegroundColor DarkYellow
         Invoke-PVEAPI -Route "cluster/sdn/vnets/$($vnet.vnet)" -Params @{
             Headers = (Get-AccessTicket)
             Method = "DELETE"
@@ -612,7 +683,7 @@ function Remove-ClassVMs {
 
         if ($vxlan) {
             # Delete the VXLAN
-            Write-Host "Deleting VXLAN $($vxlan.zone)" -ForegroundColor Gray
+            Write-Host "[-] Deleting VXLAN $($vxlan.zone)" -ForegroundColor DarkYellow
             Invoke-PVEAPI -Route "cluster/sdn/zones/$($vxlan.zone)" -Params @{
                 Headers = (Get-AccessTicket)
                 Method = "DELETE"
@@ -698,6 +769,7 @@ function Clone-VM {
     
         if ($status.data.status -eq "stopped") {
             Write-Host "    [+] Done" -ForegroundColor Green
+            $Script:RuntimeContext.VMs_Cloned += 1
             $complete = $true
         }
         else {
@@ -761,6 +833,7 @@ function Clone-UserVMs {
                 Method = "GET"
             }).data | Select tag).tag | % {[int]$_}) | Measure-Object -Maximum | Select -ExpandProperty Maximum)
             
+            # This is what will create more than one SDN per user if the class needs it
             foreach ($sdn in $sdns.Split(";")) {
                 Write-Host "[+] Creating SDN $sdn for $User" -ForegroundColor Green
         
@@ -826,7 +899,7 @@ function Clone-ProxmoxClassVMs {
 
     # STEP 2: Create a pool for the new VMs
     $pool_id = $Class -replace ' ', ''
-    Create-Pool -id $pool_id
+    Create-Pool -id $pool_id -Professor $professor
 
     # STEP 3: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
     Sync-Realm -Students $student_list -Professor $professor | Out-Null
@@ -839,11 +912,12 @@ function Clone-ProxmoxClassVMs {
 
     # STEP 5: For each template used by the class, clone a VM for each student in the class, and update the ACL to include the student and professor for the new VM
     $templates = Get-Templates -Class $Class
-    # This could probably be multithreaded, but then again probably not. Don't be a hero
+    # This could probably be multithreaded, but then again probably not. Don't be a hero.
 	foreach ($user in $users) {
         Write-Host "------- Starting config for $user -------" -ForegroundColor Magenta
 
         # Part 1 of the logic to automatically re-acquire missing VMs. This assumes that if a VM is missing, and the class requires SDNs, those SDNs already exist!
+        # IF for some reason the SDN doesn't already exist (or its alias doesn't follow the standard format), it will fail to set the SDN and fail with an error like "No VNET Specified!"
         # Part 2 of this logic is in the Clone-UserVMs function
         $does_exist = (Get-RuntimeCacheValue -Key "Initial_VM_State" -FetchBlock {
             Invoke-PVEAPI -Route "cluster/resources?type=vm" -Params @{
