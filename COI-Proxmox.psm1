@@ -318,7 +318,7 @@ function Set-SDN {
 		[Parameter(Mandatory)][int]$VM_ID,
 		[switch]$Router
 	)
-	
+
     # Unfortunately the MAC address is required when changing a network interface, so this function simply returns the MAC address given an interface on the VM.
 	function Get-MacAddress {
 		Param (
@@ -338,7 +338,7 @@ function Set-SDN {
 		vmid = $VM_ID
 	}
 	
-	if ($VNETs.length -eq 0) {
+	if ($VNETs.length -eq 0 -or -not $VNETs) {
 		Write-Warning "FATAL: Could not apply SDN $SDN to $VM_ID; No VNET specified!"
 		return $null
 	}
@@ -719,6 +719,7 @@ function Clone-VM {
             Method = "GET"
         }
     } -Step "Clone-VM with name $Name").data
+    
     $does_exist = [bool]($vms | ? {$_.name -eq $Name})
 
     if ($does_exist) {
@@ -872,7 +873,7 @@ function Clone-UserVMs {
                     Headers = (Get-AccessTicket)
                     Method = "GET"
                 }).data | ? {$_.alias -match "$Pool_?_$User"})
-                Set-SDN -SDN $template.SDN -Node $node -VNET $existing_vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
+                Set-SDN -SDN $template.SDN -Node $node -VNETs $existing_vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
             }
             else {
                 Set-SDN -SDN $template.SDN -Node $node -VNETs $vnets -VM_ID $vm_id -Router:$($template.SDN -match "router")
