@@ -247,6 +247,9 @@ function Create-Pool {
 }
 
 # Creates a new VXLAN and returns its config if successful
+# As of 4/22/25 this function isn't being used because all VNETs are bound to the "vxlntst" zone. 
+# If this changes and every VNET needs its own zone, you can change this by uncommenting the "VXLAN" parameter in the New-VirtualNetwork function and uncommenting the -VXLAN parameter when New-VirtualNetwork is called in Clone-UserVMs
+# Also, there's logic in the Remove-ClassVMs function to delete these VXLANs so you'll have to change that too.
 function New-VXLAN {
 	Param (
 		[Parameter(Mandatory)][string]$ID
@@ -283,15 +286,15 @@ function New-VXLAN {
 # Creates a new VNET and returns its config if successful
 function New-VirtualNetwork {
 	Param (
-		[Parameter(Mandatory)][hashtable]$VXLAN,
+		#[Parameter(Mandatory)][hashtable]$VXLAN,
 		[Parameter(Mandatory)][string]$ID,
 		[Parameter(Mandatory)][string]$Alias
 	)
 
-	Write-Host "    [+] Creating new VNET bound to $($VXLAN.zone); Alias: $Alias" -ForegroundColor Green
+	Write-Host "    [+] Creating new VNET with alias $Alias" -ForegroundColor Green
 	$vnet_config = @{
 		"vnet" = $ID
-		"zone" = $VXLAN.zone
+		"zone" = "vxlntst"
 		"alias" = $Alias
 		"tag" = [int]($ID.Trim("v"))
 	}
@@ -302,7 +305,7 @@ function New-VirtualNetwork {
 	}
 	
 	if ($net.Error) {
-		Write-Warning "Failed to create a new VNET with ID $ID bound to $($VXLAN.zone). $($net.Response)"
+		Write-Warning "Failed to create a new VNET with ID $ID. $($net.Response)"
 		return $null
 	}
 	return $vnet_config
@@ -608,7 +611,7 @@ function Remove-ClassVMs {
     # Get a list of VMs in the class
     $vms = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"}).data.members
     # Get a list of all VXLANs
-    $sdn_zones = (Invoke-PVEAPI -Route "cluster/sdn/zones" -Params @{Headers = (Get-AccessTicket);Method="GET"}).data
+    #$sdn_zones = (Invoke-PVEAPI -Route "cluster/sdn/zones" -Params @{Headers = (Get-AccessTicket);Method="GET"}).data
     # Get a list of VNETs
     $sdn_vnets = (Invoke-PVEAPI -Route "cluster/sdn/vnets" -Params @{Headers = (Get-AccessTicket);Method="GET"}).data
     # Filter the VM list to not include students in the $Skip array. This ensures those students won't have their VMs or SDNs deleted.
@@ -672,7 +675,7 @@ function Remove-ClassVMs {
 
     # Delete the VNETs and VXLANs
     foreach ($vnet in $sdns_to_delete) {
-        $vxlan = $sdn_zones | ? {$_.zone -eq $vnet.zone}
+        #$vxlan = $sdn_zones | ? {$_.zone -eq $vnet.zone}
 
         # Delete the VNET
         Write-Host "[-] Deleting VNET $($vnet.vnet)" -ForegroundColor DarkYellow
@@ -681,18 +684,19 @@ function Remove-ClassVMs {
             Method = "DELETE"
         } | Out-Null
 
-        if ($vxlan) {
+        <#if ($vxlan) {
             # Delete the VXLAN
             Write-Host "[-] Deleting VXLAN $($vxlan.zone)" -ForegroundColor DarkYellow
             Invoke-PVEAPI -Route "cluster/sdn/zones/$($vxlan.zone)" -Params @{
                 Headers = (Get-AccessTicket)
                 Method = "DELETE"
             } | Out-Null
-        }
+        }#>
 
         # Remove the deleted VXLAN from the $sdn_zones list. This is because some classes may have more than one VNET per zone, so the first VNET will delete the zone. We don't want it trying to delete the zone a 2nd time.
         # didn't actually test this. If you noticed issues relating to SDNs not being deleted for a class that requires more than 1 per student, this is probably the culprit.
-        $sdn_zones = $sdn_zones | ? {$_.zone -ne $vxlan.zone}
+        
+        #$sdn_zones = $sdn_zones | ? {$_.zone -ne $vxlan.zone}
     }
     Invoke-PVEAPI -Route "cluster/sdn" -Params @{
         Headers = (Get-AccessTicket)
@@ -840,7 +844,7 @@ function Clone-UserVMs {
         
                 $id = $id + 1
                 $alias = "$($Pool)_$($sdn)_$($User)"
-                $vnet = New-VirtualNetwork -VXLAN (New-VXLAN -ID "v$id") -Alias $alias -ID "v$id"
+                $vnet = New-VirtualNetwork -Alias $alias -ID "v$id" # -VXLAN (New-VXLAN -ID "v$id")
                 $vnets += $vnet
             }
             
