@@ -291,7 +291,7 @@ function New-VirtualNetwork {
 		[Parameter(Mandatory)][string]$Alias
 	)
 
-	Write-Host "    [+] Creating new VNET with alias $Alias" -ForegroundColor Green
+	Write-Host "    [+] Creating new VNET - Alias: $Alias - ID: $ID" -ForegroundColor Green
 	$vnet_config = @{
 		"vnet" = $ID
 		"zone" = "vxlntst"
@@ -442,7 +442,7 @@ function Get-Templates {
 function Set-ClassTA {
     Param (
         [Parameter(Mandatory)][string]$User,
-        [Parameter(Mandatory)][string]$Class,
+        [Parameter(Mandatory)][string]$Pool,
         [Parameter(Mandatory)][string]$Professor,
         [switch]$CloneVM
     )
@@ -463,7 +463,8 @@ function Set-ClassTA {
         }
     }
 
-    $pool_id = $Class -replace ' ', ''
+    $pool_id = $Pool
+    #$pool_id = $Class -replace ' ', ''
 
     # Set permissions on the resource pool
     # Yes, the 'propagate' parameter is used here, but this doesn't allow users with permissions on the POOL to do anything other than simply view the VMs inside the pool.
@@ -477,7 +478,7 @@ function Set-ClassTA {
             users = "$User@NKU"
             propagate = 1
         }
-    } | Out-Null
+    } -ErrorBehavior "Stop" | Out-Null
 
     # Get all VMs in the class
     $pool_members = (Get-RuntimeCacheValue -Key "Initial_VM_State" -FetchBlock {
@@ -487,18 +488,25 @@ function Set-ClassTA {
         } -ErrorBehavior "Stop"
     } -Step "VM Discovery in Set-ClassTA").data | ? {$_.pool -eq $pool_id} | Select -ExpandProperty vmid
 
+    if ($pool_members.length -eq 0) {
+        Write-Warning "No pool members found for $Pool. Make sure the spelling is correct. Ending program..."
+        return $null
+    }
+    else {
+        Write-Host "Permissions on $pool_id set for $User" -ForegroundColor Green
+    }
+
     # Explicitly set permissions on each VM
     foreach ($id in $pool_members) {
         Set-ProxmoxACL -Professor $Professor -User $User -ID $id
     }
-
-    Write-Host "Permissions on $pool_id set for $User" -ForegroundColor Green
 
     if ($CloneVM) {
         $Nodes = (Get-RuntimeCacheValue -Key "Available_Nodes" -FetchBlock {
             @((Invoke-PVEAPI -Route "cluster/config/nodes" -Params @{Headers = (Get-AccessTicket); Method = "GET"} -ErrorBehavior "Stop").data)
         } -Step "Available nodes in Set-ClassTA") | Select -ExpandProperty name
 
+        $Class = ($Pool.Split('-')[0]) -replace '(\D)(\d)', '$1 $2'
         Clone-UserVMs -User $User -Professor $Professor -Pool $pool_id -Templates (Get-Templates -Class $Class) -Nodes $Nodes -StartingNodeIndex -1 | Out-Null
     }
     Generate-CacheReport
@@ -602,14 +610,15 @@ function Sync-Realm {
 # But you can get around those errors by using the -SkipUnreferencedDisks option.
 function Remove-ClassVMs {
     Param (
-        [Parameter(Mandatory)]$Class,
+        [Parameter(Mandatory)]$Pool,
         [array]$Skip,
         [switch]$SkipUnreferencedDisks
     )
 
-    $pool_id = $Class -replace ' ', ''
+    #$pool_id = $Class -replace ' ', ''
+    $pool_id = $Pool
     # Get a list of VMs in the class
-    $vms = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"}).data.members
+    $vms = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"} -ErrorBehavior "Stop").data.members
     # Get a list of all VXLANs
     #$sdn_zones = (Invoke-PVEAPI -Route "cluster/sdn/zones" -Params @{Headers = (Get-AccessTicket);Method="GET"}).data
     # Get a list of VNETs
@@ -661,7 +670,7 @@ function Remove-ClassVMs {
         } | Out-Null
 
         # Waiting a couple seconds before the next delete operation ensures ceph has enough time to process the last. This prevents delete fails although they're still possible
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 3
     }
 
     if (-not $Skip) {
@@ -892,6 +901,7 @@ function Clone-ProxmoxClassVMs {
     # Entrypoint; start here for debugging
     Param (
         [Parameter(Mandatory)][string]$Class,
+        [Parameter(Mandatory)][string]$Semester,
         [string]$CustomRosterPath = $null
     )
 
@@ -903,7 +913,8 @@ function Clone-ProxmoxClassVMs {
     $users = @($student_list) + $professor
 
     # STEP 2: Create a pool for the new VMs
-    $pool_id = $Class -replace ' ', ''
+    $pool_id = "$Class-$Semester" -replace ' ',''
+    #$pool_id = $Class -replace ' ', ''
     Create-Pool -id $pool_id -Professor $professor
 
     # STEP 3: Add each student to the Proxmox_Students AD group, the professor to Proxmox_Faculty, and sync the Proxmox realm
