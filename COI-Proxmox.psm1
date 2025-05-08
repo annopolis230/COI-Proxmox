@@ -604,6 +604,27 @@ function Sync-Realm {
     }
 }
 
+function Take-VMSnapshots {
+    Param (
+        [Parameter(Mandatory)]$Pool
+    )
+
+    $vms = (Invoke-PVEAPI -Route "pools/$Pool" -Params @{Headers=(Get-AccessTicket);Method="GET"} -ErrorBehavior "Stop").data.members
+
+    foreach ($vm in $vms) {
+        Write-Host "[+] Taking snapshot for $($vm.name)" -ForegroundColor Green
+        Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)/snapshot" -Params @{
+            Headers = (Get-AccessTicket)
+            Method = "POST"
+            Body = @{
+                snapname = "Day1"
+                vmstate = 0
+                description = "Used to revert VM to initial state. Do not delete!"
+            }
+        } | Out-Null
+    }
+}
+
 # Remove all VMs and other configuration items such as HA and SDNs for a given class, with the option to skip certain students if necessary
 # I didn't include fallback logic to avoid unecessary API overhead and keep the deletion process fast and predictable.
 # If deletion fails, that's a signal of underlying storage issues that should fixed at the infrastructure level.
