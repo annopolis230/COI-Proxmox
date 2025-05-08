@@ -125,7 +125,7 @@ function Invoke-PVEAPI {
     catch [System.Net.WebException] {
         $err = $true
 
-        if (-not $Silent) {Write-Warning "$($_.Exception.Message) to route $($route) with method $($Params.Method)"}
+        if (-not $Silent) {Write-Warning "DEBUG: $($_.Exception.Message) to route $($route) with method $($Params.Method)"}
 
         if ($_.Exception.Response.StatusCode.value__) {
             $to_return = @{
@@ -139,7 +139,7 @@ function Invoke-PVEAPI {
         }
     }
     catch [ApiException] {
-        if (-not $Silent) {Write-Warning "$($_.Exception.Message) to route $($route) with method $($Params.Method)"}
+        if (-not $Silent) {Write-Warning "DEBUG: $($_.Exception.Message) to route $($route) with method $($Params.Method)"}
         $err = $true
         $to_return = @{
             StatusCode = $_.Exception.StatusCode
@@ -622,6 +622,8 @@ function Take-VMSnapshots {
                 description = "Used to revert VM to initial state. Do not delete!"
             }
         } | Out-Null
+
+        Start-Sleep -Seconds 1
     }
 }
 
@@ -639,13 +641,13 @@ function Remove-ClassVMs {
     #$pool_id = $Class -replace ' ', ''
     $pool_id = $Pool
     # Get a list of VMs in the class
-    $vms = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"} -ErrorBehavior "Stop").data.members
+    
     # Get a list of all VXLANs
     #$sdn_zones = (Invoke-PVEAPI -Route "cluster/sdn/zones" -Params @{Headers = (Get-AccessTicket);Method="GET"}).data
     # Get a list of VNETs
     $sdn_vnets = (Invoke-PVEAPI -Route "cluster/sdn/vnets" -Params @{Headers = (Get-AccessTicket);Method="GET"}).data
     # Filter the VM list to not include students in the $Skip array. This ensures those students won't have their VMs or SDNs deleted.
-    $vms_to_delete = $vms | ? {-not ($_.name.Split('-')[-2] -in $Skip)}
+    
     # Filter the VNET list to only include VNETs used by that class, and not those used by students in the $Skip array
     $sdns_to_delete = @($sdn_vnets | ? {($_.alias -match $pool_id) -and (-not ($_.alias.Split('_')[-1] -in $Skip))})
 
@@ -657,46 +659,55 @@ function Remove-ClassVMs {
         $Params = "?purge=1&destroy-unreferenced-disks=1"
     }
     # Delete the VMs
-    foreach ($vm in $vms_to_delete) {
-        if ($vm.status -eq "running") {
-            Write-Warning "VM $($vm.name) is running. Stopping now..."
+    # Often, VM deletions will fail due to the error: rbd listing failed, or something similar.
+    # This is likely due to ceph not being able to keep up with all the delete tasks happening at once. It does wait 3 seconds between each task, but that's not enough on its own
+    # Additionally, the amount of time it should wait can vary. 
+    # So the script will keep trying to delete the VMs until they're actually all gone. That's why there's a do-while loop here.
+    do {
+        $vms = (Invoke-PVEAPI -Route "pools/$pool_id" -Params @{Headers=(Get-AccessTicket);Method="GET"} -ErrorBehavior "Stop").data.members
+        $vms_to_delete = $vms | ? {-not ($_.name.Split('-')[-2] -in $Skip)}
 
-            Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)/status/stop" -Params @{
-                Headers = (Get-AccessTicket)
-                Method = "POST"
-            } | Out-Null
-
-            Start-Sleep -Seconds 3
-            $complete = $false
-
-            do {
-                $status = Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)/status/current" -Params @{
+        foreach ($vm in $vms_to_delete) {
+            if ($vm.status -eq "running") {
+                Write-Warning "VM $($vm.name) is running. Stopping now..."
+    
+                Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)/status/stop" -Params @{
                     Headers = (Get-AccessTicket)
-                    Method = "GET"
-                }
-
-                if ($status.data.status -eq "stopped") {
-                    $complete = $true
-                }
-                else {
-                    Start-Sleep -Seconds 3
-                }
-            } while (-not $complete)
+                    Method = "POST"
+                } | Out-Null
+    
+                Start-Sleep -Seconds 3
+                $complete = $false
+    
+                do {
+                    $status = Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)/status/current" -Params @{
+                        Headers = (Get-AccessTicket)
+                        Method = "GET"
+                    }
+    
+                    if ($status.data.status -eq "stopped") {
+                        $complete = $true
+                    }
+                    else {
+                        Start-Sleep -Seconds 3
+                    }
+                } while (-not $complete)
+            }
+    
+            Write-Host "[-] Attempting to delete $($vm.name)" -ForegroundColor White
+            Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)$Params" -Params @{
+                Headers = (Get-AccessTicket)
+                Method = "DELETE"
+            } -Silent | Out-Null
+    
+            # Waiting a couple seconds before the next delete operation ensures ceph has enough time to process the last. This prevents delete fails although they're still possible
+            Start-Sleep -Milliseconds 2500
         }
-
-        Write-Host "[-] Deleting $($vm.name)" -ForegroundColor DarkYellow
-        Invoke-PVEAPI -Route "nodes/$($vm.node)/qemu/$($vm.vmid)$Params" -Params @{
-            Headers = (Get-AccessTicket)
-            Method = "DELETE"
-        } | Out-Null
-
-        # Waiting a couple seconds before the next delete operation ensures ceph has enough time to process the last. This prevents delete fails although they're still possible
-        Start-Sleep -Seconds 3
-    }
+    } while ($vms_to_delete.length -gt 0)
 
     if (-not $Skip) {
         # Delete the pool if all members were deleted
-        Write-Host "[-] Deleting pool $pool_id" -ForegroundColor DarkYellow
+        Write-Host "[-] Deleting pool $pool_id" -ForegroundColor White
         Invoke-PVEAPI -Route "pools/?poolid=$pool_id" -Params @{
             Headers = (Get-AccessTicket)
             Method = "DELETE"
@@ -708,7 +719,7 @@ function Remove-ClassVMs {
         #$vxlan = $sdn_zones | ? {$_.zone -eq $vnet.zone}
 
         # Delete the VNET
-        Write-Host "[-] Deleting VNET $($vnet.vnet)" -ForegroundColor DarkYellow
+        Write-Host "[-] Deleting VNET $($vnet.vnet)" -ForegroundColor White
         Invoke-PVEAPI -Route "cluster/sdn/vnets/$($vnet.vnet)" -Params @{
             Headers = (Get-AccessTicket)
             Method = "DELETE"
@@ -923,7 +934,8 @@ function Clone-ProxmoxClassVMs {
     Param (
         [Parameter(Mandatory)][string]$Class,
         [Parameter(Mandatory)][string]$Semester,
-        [string]$CustomRosterPath = $null
+        [string]$CustomRosterPath = $null,
+        [switch]$TakeSnapshots
     )
 
     Initialize-RuntimeCache
@@ -976,5 +988,10 @@ function Clone-ProxmoxClassVMs {
             $last_index = Clone-UserVMs -User $User -Professor $professor -Pool $pool_id -Templates $templates -StartingNodeIndex $last_index -Nodes $Nodes
         }
 	}
+
+    if ($TakeSnapshots) {
+        Take-VMSnapshots -Pool $pool_id
+    }
+
     Generate-CacheReport
 }
